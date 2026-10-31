@@ -1,0 +1,40 @@
+# Ambiente Virtual Python
+venv/
+.venv/
+ENV/
+env/
+
+# Arquivos Python compilados / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Variáveis de ambiente e segredos
+.env
+.env.*
+!.env.example
+
+# Django & Armazenamento Local de Testes (mantém as pastas com .gitkeep, ignora os PDFs)
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+staticfiles/
+media/
+storage_local/novos_diarios/*.pdf
+storage_local/diarios_processados/*
+
+# Sistema Operacional / IDEs
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.agents
+
+# Obsidian
+Docs_Vault
+Docs_Vault/.obsidian/workspace.json
+Docs_Vault/.obsidian/workspace-mobile.json
