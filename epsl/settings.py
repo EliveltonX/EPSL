@@ -91,15 +91,27 @@ ASGI_APPLICATION = "epsl.asgi.application"
 # - Em TESTE (Local): Padrão local do Django (SQLite3 em arquivo `db.sqlite3`),
 #   ou MySQL local caso `TEST_DB_ENGINE=mysql` seja definido no `.env`.
 # ==============================================================================
+def _sanitize_db_host(raw_host: str) -> str:
+    """Remove acidentais prefixos http(s)://, barras ou portas do DB_HOST."""
+    host = raw_host.strip()
+    for prefix in ("https://", "http://"):
+        if host.lower().startswith(prefix):
+            host = host[len(prefix) :]
+    host = host.split("/")[0].strip()
+    if ":" in host and not host.startswith("["):
+        host = host.split(":")[0].strip()
+    return host
+
+
 if IS_DEPLOY:
     DATABASES = {
         "default": {
-            "ENGINE": os.getenv("DB_ENGINE", "django.db.backends.postgresql"),
-            "NAME": os.getenv("DB_NAME", "postgres"),
-            "USER": os.getenv("DB_USER", "postgres"),
-            "PASSWORD": os.getenv("DB_PASSWORD", ""),
-            "HOST": os.getenv("DB_HOST", "localhost"),
-            "PORT": os.getenv("DB_PORT", "5432"),
+            "ENGINE": os.getenv("DB_ENGINE", "django.db.backends.postgresql").strip(),
+            "NAME": os.getenv("DB_NAME", "postgres").strip(),
+            "USER": os.getenv("DB_USER", "postgres").strip(),
+            "PASSWORD": os.getenv("DB_PASSWORD", "").strip(),
+            "HOST": _sanitize_db_host(os.getenv("DB_HOST", "localhost")),
+            "PORT": os.getenv("DB_PORT", "5432").strip(),
         }
     }
 else:
