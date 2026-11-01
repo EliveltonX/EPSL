@@ -52,6 +52,12 @@ def home_status(request: HttpRequest) -> HttpResponse:
 
     modo = "DEPLOY (Produção Coolify)" if settings.IS_DEPLOY else "TESTE LOCAL"
     db_engine = settings.DATABASES["default"]["ENGINE"]
+    db_warning = getattr(settings, "DB_CONNECTION_WARNING", "")
+    bloco_db_warning = (
+        f'<div class="alert alert-warning" style="margin-top:12px;">⚠️ <strong>Aviso de Conexão PostgreSQL:</strong> {html.escape(db_warning)}</div>'
+        if db_warning
+        else ""
+    )
     total_licitacoes = Licitacao.objects.count()
 
     if settings.USE_LOCAL_STORAGE:
@@ -163,6 +169,7 @@ def home_status(request: HttpRequest) -> HttpResponse:
             <h2>📊 Informações de Status do Sistema</h2>
             <p><strong>Modo de Operação:</strong> <span class="badge">{modo}</span></p>
             <p><strong>Banco de Dados Ativo:</strong> <code>{db_engine}</code></p>
+            {bloco_db_warning}
             <p><strong>Storage Configurado:</strong> {storage_info}</p>
             <p><strong>Licitações Cadastradas no Banco:</strong> <strong>{total_licitacoes}</strong></p>
         </div>

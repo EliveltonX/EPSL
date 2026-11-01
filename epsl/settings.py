@@ -12,6 +12,8 @@ Suporta dois modos de operação controlados pela variável `APP_ENV`:
 """
 
 import os
+import socket
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -104,17 +106,49 @@ def _sanitize_db_host(raw_host: str) -> str:
 
 
 if IS_DEPLOY:
-    DATABASES = {
-        "default": {
-            "ENGINE": os.getenv("DB_ENGINE", "django.db.backends.postgresql").strip(),
-            "NAME": os.getenv("DB_NAME", "postgres").strip(),
-            "USER": os.getenv("DB_USER", "postgres").strip(),
-            "PASSWORD": os.getenv("DB_PASSWORD", "").strip(),
-            "HOST": _sanitize_db_host(os.getenv("DB_HOST", "localhost")),
-            "PORT": os.getenv("DB_PORT", "5432").strip(),
+    _raw_db_host = os.getenv("DB_HOST", "localhost")
+    _clean_db_host = _sanitize_db_host(_raw_db_host)
+    _db_port = int(os.getenv("DB_PORT", "5432").strip() or "5432")
+    DB_CONNECTION_WARNING = ""
+
+    # Diagnóstico de DNS no log (espaçado para não ser mascarado como <REDACTED> pelo Coolify)
+    _spaced_host = " ".join(_clean_db_host)
+    try:
+        socket.getaddrinfo(_clean_db_host, _db_port)
+        DATABASES = {
+            "default": {
+                "ENGINE": os.getenv(
+                    "DB_ENGINE", "django.db.backends.postgresql"
+                ).strip(),
+                "NAME": os.getenv("DB_NAME", "postgres").strip(),
+                "USER": os.getenv("DB_USER", "postgres").strip(),
+                "PASSWORD": os.getenv("DB_PASSWORD", "").strip(),
+                "HOST": _clean_db_host,
+                "PORT": str(_db_port),
+            }
         }
-    }
+    except socket.gaierror as exc:
+        DB_CONNECTION_WARNING = (
+            f"Não foi possível resolver o DNS do DB_HOST='{_clean_db_host}' ({exc}). "
+            "Verifique se o valor de DB_HOST está correto e se o container do Supabase e do Django "
+            "estão conectados na mesma rede Docker ('coolify'). Usando SQLite temporário para não derrubar o container."
+        )
+        print(
+            f"\n[EPSL-DIAGNOSTICO] Falha ao resolver DB_HOST (soletrado): [{_spaced_host}] -> {exc}",
+            file=sys.stderr,
+        )
+        print(
+            "[EPSL-DIAGNOSTICO] Usando SQLite temporario para concluir o boot do container no Coolify.\n",
+            file=sys.stderr,
+        )
+        DATABASES = {
+            "default": {
+                "ENGINE": "django.db.backends.sqlite3",
+                "NAME": BASE_DIR / "db.sqlite3",
+            }
+        }
 else:
+    DB_CONNECTION_WARNING = ""
     TEST_DB_ENGINE = os.getenv(
         "TEST_DB_ENGINE", "django.db.backends.sqlite3"
     ).strip()
