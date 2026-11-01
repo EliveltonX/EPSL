@@ -40,9 +40,35 @@ DEBUG = os.getenv("DEBUG", "False" if IS_DEPLOY else "True").lower() in (
 
 ALLOWED_HOSTS = [
     host.strip()
-    for host in os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+    for host in os.getenv(
+        "ALLOWED_HOSTS",
+        "localhost,127.0.0.1,.eliveltonpardini.com.br",
+    ).split(",")
     if host.strip()
 ]
+
+# Configuração automática de CSRF_TRUSTED_ORIGINS e Proxy Reverso (Coolify Traefik / Cloudflare)
+_trusted_origins = [
+    "https://*.eliveltonpardini.com.br",
+    "http://*.eliveltonpardini.com.br",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+for _h in ALLOWED_HOSTS:
+    _clean_h = _h.lstrip(".")
+    if _clean_h and _clean_h != "*":
+        _trusted_origins.append(f"https://{_clean_h}")
+        _trusted_origins.append(f"http://{_clean_h}")
+        if "." in _clean_h:
+            _trusted_origins.append(f"https://*.{_clean_h}")
+
+for _extra_origin in os.getenv("CSRF_TRUSTED_ORIGINS", "").split(","):
+    if _extra_origin.strip():
+        _trusted_origins.append(_extra_origin.strip())
+
+CSRF_TRUSTED_ORIGINS = sorted(set(_trusted_origins))
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+USE_X_FORWARDED_HOST = True
 
 INSTALLED_APPS = [
     "django.contrib.admin",

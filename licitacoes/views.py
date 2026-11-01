@@ -17,12 +17,13 @@ from django.http import (
 )
 from django.middleware.csrf import get_token
 from django.utils.http import url_has_allowed_host_and_scheme
-from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
 from licitacoes.models import Licitacao
 
 
+@ensure_csrf_cookie
 @require_http_methods(["GET", "POST"])
 def home_status(request: HttpRequest) -> HttpResponse:
     """
@@ -188,6 +189,7 @@ def logout_view(request: HttpRequest) -> HttpResponseRedirect:
 
 
 @login_required
+@ensure_csrf_cookie
 @require_GET
 def painel_licitacoes(request: HttpRequest) -> HttpResponse:
     """
