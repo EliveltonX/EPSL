@@ -163,3 +163,4 @@ def gerar_lote_urls_upload(filenames: List[str]) -> List[Dict[str, Any]]:
         )
 
     return instrucoes_upload
+

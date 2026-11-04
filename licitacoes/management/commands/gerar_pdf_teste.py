@@ -104,3 +104,4 @@ class Command(BaseCommand):
                 f"PDF de teste gerado com sucesso em: {dest_path} (4 páginas: páginas 2 e 4 contêm licitações de TI)."
             )
         )
+

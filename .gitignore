@@ -26,6 +26,7 @@ staticfiles/
 media/
 storage_local/novos_diarios/*.pdf
 storage_local/diarios_processados/*
+storage_local/
 
 # Sistema Operacional / IDEs
 .DS_Store

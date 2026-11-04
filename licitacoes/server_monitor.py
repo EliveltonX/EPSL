@@ -466,3 +466,4 @@ def obter_snapshot_completo(forcar_storage: bool = False) -> Dict[str, Any]:
         "banco": coletar_metricas_banco(),
         "storage": coletar_metricas_storage(forcar_atualizacao=forcar_storage),
     }
+
