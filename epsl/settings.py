@@ -236,6 +236,11 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # - Em DEPLOY (`USE_LOCAL_STORAGE = False`): Supabase Storage via S3 (`boto3`)
 # ==============================================================================
 USE_LOCAL_STORAGE = not IS_DEPLOY
+FORCE_S3_DIRECT_UPLOAD = os.getenv("FORCE_S3_DIRECT_UPLOAD", "False").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 
 LOCAL_STORAGE_ROOT = Path(
     os.getenv("LOCAL_STORAGE_ROOT", str(BASE_DIR / "storage_local"))

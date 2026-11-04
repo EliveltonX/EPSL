@@ -202,6 +202,24 @@ class Command(BaseCommand):
         )
         return arquivos
 
+    def _gerar_nome_unico_local(self, dest_dir: Path, filename: str) -> str:
+        """
+        Se já existir um arquivo com o mesmo nome na pasta de destino local,
+        adiciona um sufixo incremental (_2, _3, ...) antes da extensão .pdf.
+        """
+        candidato = dest_dir / filename
+        if not candidato.exists():
+            return filename
+
+        stem = Path(filename).stem
+        suffix = Path(filename).suffix or ".pdf"
+        contador = 2
+        while True:
+            novo_nome = f"{stem}_{contador}{suffix}"
+            if not (dest_dir / novo_nome).exists():
+                return novo_nome
+            contador += 1
+
     def _mover_pdf_local_para_processados(
         self,
         source_path_str: str,
@@ -210,10 +228,10 @@ class Command(BaseCommand):
     ) -> str:
         """
         Move o PDF da pasta local `storage_local/novos_diarios/{arquivo.pdf}` para
-        `storage_local/diarios_processados/{YYYY}/{MM}/{arquivo.pdf}` e retorna a URL local.
+        `storage_local/diarios_processados/{YYYY}/{MM}/{arquivo.pdf}` (renomeando
+        automaticamente caso já exista arquivo com o mesmo nome) e retorna a URL local.
         """
         source_path = Path(source_path_str)
-        filename = source_path.name
         prefix_limpo = processed_prefix.strip("/")
         ano = f"{data_ref.year:04d}"
         mes = f"{data_ref.month:02d}"
@@ -221,6 +239,7 @@ class Command(BaseCommand):
         dest_dir = Path(settings.LOCAL_STORAGE_ROOT) / prefix_limpo / ano / mes
         dest_dir.mkdir(parents=True, exist_ok=True)
 
+        filename = self._gerar_nome_unico_local(dest_dir, source_path.name)
         dest_path = dest_dir / filename
         shutil.move(str(source_path), str(dest_path))
 
@@ -256,6 +275,42 @@ class Command(BaseCommand):
 
         return pdf_keys
 
+    def _s3_objeto_existe(
+        self, s3_client: BaseClient, bucket_name: str, key: str
+    ) -> bool:
+        """Verifica se uma chave (Key) já existe no bucket S3/Supabase Storage."""
+        try:
+            s3_client.head_object(Bucket=bucket_name, Key=key)
+            return True
+        except Exception:
+            return False
+
+    def _gerar_chave_unica_s3(
+        self,
+        s3_client: BaseClient,
+        bucket_name: str,
+        base_prefix: str,
+        filename: str,
+    ) -> str:
+        """
+        O protocolo S3 / Supabase Storage NÃO renomeia arquivos automaticamente (ele sobrescreve
+        no PutObject/CopyObject ou retorna erro 409). Esta função verifica se a chave já existe
+        em `diarios_processados/{YYYY}/{MM}/` e, se existir, adiciona `_2`, `_3`, etc.
+        """
+        candidato_key = f"{base_prefix}/{filename}"
+        if not self._s3_objeto_existe(s3_client, bucket_name, candidato_key):
+            return candidato_key
+
+        stem = Path(filename).stem
+        suffix = Path(filename).suffix or ".pdf"
+        contador = 2
+        while True:
+            novo_nome = f"{stem}_{contador}{suffix}"
+            nova_key = f"{base_prefix}/{novo_nome}"
+            if not self._s3_objeto_existe(s3_client, bucket_name, nova_key):
+                return nova_key
+            contador += 1
+
     def _mover_pdf_s3_para_processados(
         self,
         s3_client: BaseClient,
@@ -266,13 +321,20 @@ class Command(BaseCommand):
     ) -> str:
         """
         Move o PDF no Supabase Storage de `novos_diarios/{arquivo.pdf}` para
-        `diarios_processados/{YYYY}/{MM}/{arquivo.pdf}` e retorna o link público.
+        `diarios_processados/{YYYY}/{MM}/{arquivo.pdf}` (garantindo nome único sem sobrescrever)
+        e retorna o link público.
         """
         filename = source_key.split("/")[-1]
         prefix_limpo = processed_prefix.strip("/")
         ano = f"{data_ref.year:04d}"
         mes = f"{data_ref.month:02d}"
-        dest_key = f"{prefix_limpo}/{ano}/{mes}/{filename}"
+        base_dest_prefix = f"{prefix_limpo}/{ano}/{mes}"
+        dest_key = self._gerar_chave_unica_s3(
+            s3_client=s3_client,
+            bucket_name=bucket_name,
+            base_prefix=base_dest_prefix,
+            filename=filename,
+        )
 
         s3_client.copy_object(
             Bucket=bucket_name,
