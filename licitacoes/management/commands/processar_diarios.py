@@ -330,7 +330,12 @@ class Command(BaseCommand):
                 "A variável de ambiente GEMINI_API_KEY não está configurada."
             )
 
-        client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        client = genai.Client(
+            api_key=settings.GEMINI_API_KEY,
+            http_options=types.HttpOptions(
+                retry_options=types.HttpRetryOptions(attempts=1)
+            ),
+        )
 
         blocos_paginas = []
         for num_pag, texto, termos in paginas_promissoras:
@@ -354,15 +359,36 @@ class Command(BaseCommand):
             f"{conteudo_paginas}"
         )
 
-        response = client.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=ResultadoExtracaoDiarioSchema,
-                temperature=0.1,
-            ),
-        )
+        modelos_candidatos = []
+        for m in getattr(settings, "GEMINI_FALLBACK_MODELS", [settings.GEMINI_MODEL]):
+            if m and m not in modelos_candidatos:
+                modelos_candidatos.append(m)
+
+        response = None
+        ultimo_erro = None
+        for modelo_atual in modelos_candidatos:
+            try:
+                response = client.models.generate_content(
+                    model=modelo_atual,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=ResultadoExtracaoDiarioSchema,
+                        temperature=0.1,
+                    ),
+                )
+                self.stdout.write(f"   Extraído com sucesso utilizando o modelo: {modelo_atual}")
+                break
+            except Exception as exc:
+                ultimo_erro = exc
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"   [Aviso] Modelo '{modelo_atual}' indisponível ({exc}). Tentando próximo modelo de fallback..."
+                    )
+                )
+
+        if response is None:
+            raise RuntimeError(f"Todos os modelos Gemini falharam. Último erro: {ultimo_erro}")
 
         if not response.text:
             return []
