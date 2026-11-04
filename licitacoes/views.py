@@ -23,6 +23,7 @@ from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
 from licitacoes.models import Licitacao
+from licitacoes.server_monitor import obter_snapshot_completo
 from licitacoes.storage_upload import gerar_lote_urls_upload, sanitizar_nome_pdf
 
 
@@ -90,6 +91,7 @@ def home_status(request: HttpRequest) -> HttpResponse:
             <div class="actions">
                 <a href="/licitacoes/" class="btn btn-primary">📄 Abrir Painel de Licitações</a>
                 <a href="/licitacoes/upload/" class="btn btn-secondary">📤 Upload de Múltiplos PDFs</a>
+                <a href="/licitacoes/servidor/" class="btn btn-secondary">🖥️ Monitor do Servidor & Storage</a>
                 <a href="/admin/" class="btn btn-secondary">⚙️ Django Admin (/admin/)</a>
             </div>
             <form method="post" action="/logout/" style="margin-top: 16px;">
@@ -344,6 +346,7 @@ def painel_licitacoes(request: HttpRequest) -> HttpResponse:
         <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
             <a href="/" class="btn btn-secondary">🏠 Página Inicial</a>
             <a href="/licitacoes/upload/" class="btn btn-primary" style="background:#059669;">📤 Enviar PDFs (Upload Múltiplo)</a>
+            <a href="/licitacoes/servidor/" class="btn btn-secondary">🖥️ Monitor do Servidor</a>
             <a href="/admin/" class="btn btn-secondary">⚙️ Admin</a>
             <form method="post" action="/licitacoes/processar-web/" style="margin:0;">
                 <input type="hidden" name="csrfmiddlewaretoken" value="{csrf_token}">
@@ -1068,3 +1071,504 @@ def receber_stream_pdf_local(request: HttpRequest, filename: str) -> JsonRespons
         },
         status=201,
     )
+
+
+@login_required
+@require_GET
+def metricas_servidor_json(request: HttpRequest) -> JsonResponse:
+    """
+    Endpoint JSON (`/licitacoes/servidor/metricas/`) consumido a cada 3 segundos
+    pela Dashboard do Servidor para atualizar CPU, RAM, Discos, Processos, Banco e Supabase Storage.
+    Aceita `?refresh_storage=1` para forçar recontagem imediata do bucket S3 / pasta local.
+    """
+    forcar_storage = request.GET.get("refresh_storage") == "1"
+    dados = obter_snapshot_completo(forcar_storage=forcar_storage)
+    return JsonResponse({"status": "sucesso", "dados": dados})
+
+
+@login_required
+@require_GET
+def painel_servidor(request: HttpRequest) -> HttpResponse:
+    """
+    Dashboard de Monitoramento do Servidor e Storage (`/licitacoes/servidor/`)
+    inspirada no Gerenciador de Tarefas do Windows:
+    - Gráficos históricos em tempo real (CPU % e RAM %) e uso individual por núcleo (vCPU).
+    - Consumo de Memória RAM, Swap, Rede (TX/RX e velocidade instantânea) e Uptime.
+    - Armazenamento físico do Servidor (partições e discos locais).
+    - Armazenamento interno do Supabase Storage / Local (`novos_diarios/`, `diarios_processados/{YYYY}/{MM}/`)
+      e tamanho físico do Banco de Dados (PostgreSQL/SQLite).
+    - Tabela de Top Processos ativos no servidor/container.
+    """
+    snapshot_inicial = json.dumps(obter_snapshot_completo(forcar_storage=False))
+    username_esc = html.escape(request.user.get_username())
+
+    pagina_html = f"""<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Monitor do Servidor & Storage — EPSL</title>
+    <style>
+        * {{ box-sizing: border-box; }}
+        body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 1280px; margin: 24px auto; padding: 0 20px; color: #1f2937; background: #0f172a; line-height: 1.5; }}
+        .topbar {{ display: flex; justify-content: space-between; align-items: center; background: #1e293b; color: #f8fafc; padding: 16px 24px; border-radius: 12px; border: 1px solid #334155; margin-bottom: 18px; flex-wrap: wrap; gap: 12px; }}
+        .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-bottom: 18px; }}
+        .grid-4 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin-bottom: 18px; }}
+        @media (max-width: 900px) {{ .grid-2 {{ grid-template-columns: 1fr; }} }}
+        .card {{ background: #1e293b; color: #f8fafc; padding: 20px; border-radius: 12px; border: 1px solid #334155; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }}
+        .card h2, .card h3 {{ margin-top: 0; color: #f8fafc; font-size: 1.08rem; display: flex; justify-content: space-between; align-items: center; }}
+        .kpi-card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px 18px; color: #f8fafc; }}
+        .kpi-label {{ font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; color: #94a3b8; font-weight: 700; }}
+        .kpi-value {{ font-size: 1.55rem; font-weight: 800; margin-top: 4px; color: #38bdf8; }}
+        .kpi-sub {{ font-size: 0.82rem; color: #cbd5e1; margin-top: 4px; }}
+        .btn {{ display: inline-block; padding: 8px 14px; border-radius: 8px; font-weight: 600; font-size: 0.88rem; text-decoration: none; border: none; cursor: pointer; }}
+        .btn-primary {{ background: #2563eb; color: #fff; }}
+        .btn-primary:hover {{ background: #1d4ed8; }}
+        .btn-secondary {{ background: #334155; color: #f8fafc; border: 1px solid #475569; }}
+        .btn-secondary:hover {{ background: #475569; }}
+        .btn-success {{ background: #059669; color: #fff; }}
+        .bar-bg {{ width: 100%; height: 12px; background: #0f172a; border-radius: 999px; overflow: hidden; border: 1px solid #334155; margin: 6px 0; }}
+        .bar-fill {{ height: 100%; border-radius: 999px; transition: width 0.35s ease; background: #38bdf8; }}
+        .bar-green {{ background: linear-gradient(90deg, #10b981, #059669); }}
+        .bar-amber {{ background: linear-gradient(90deg, #f59e0b, #d97706); }}
+        .bar-red {{ background: linear-gradient(90deg, #ef4444, #dc2626); }}
+        .cores-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; margin-top: 12px; }}
+        .core-box {{ background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 8px 10px; font-size: 0.8rem; }}
+        canvas.sparkline {{ width: 100%; height: 120px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; display: block; margin-top: 8px; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 0.86rem; margin-top: 10px; }}
+        th, td {{ border-bottom: 1px solid #334155; padding: 8px 10px; text-align: left; color: #e2e8f0; }}
+        th {{ background: #0f172a; color: #94a3b8; font-weight: 700; text-transform: uppercase; font-size: 0.75rem; }}
+        .badge {{ display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 0.76rem; font-weight: 700; background: #1e3a8a; color: #93c5fd; }}
+        .badge-live {{ background: #065f46; color: #6ee7b7; animation: pulse 2s infinite; }}
+        @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.65; }} }}
+        .disk-item {{ background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }}
+        .muted {{ color: #94a3b8; font-size: 0.84rem; }}
+    </style>
+</head>
+<body>
+    <div class="topbar">
+        <div>
+            <strong style="font-size:1.15rem;">🖥️ Gerenciador de Recursos do Servidor & Storage Supabase</strong>
+            <span id="statusLiveBadge" class="badge badge-live" style="margin-left:10px;">● AO VIVO (3s)</span>
+            <span class="muted" style="margin-left:10px;">Última leitura: <strong id="lblTimestamp" style="color:#f8fafc;">--:--:--</strong> | Usuário: {username_esc}</span>
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button id="btnToggleLive" class="btn btn-secondary" onclick="alternarTempoReal()">⏸️ Pausar Tempo Real</button>
+            <button class="btn btn-primary" onclick="buscarMetricas(true)">🔄 Recalcular Storage Agora</button>
+            <a href="/licitacoes/" class="btn btn-secondary">📄 Painel de Licitações</a>
+            <a href="/licitacoes/upload/" class="btn btn-success">📤 Upload de PDFs</a>
+            <a href="/" class="btn btn-secondary">🏠 Início</a>
+        </div>
+    </div>
+
+    <!-- KPIs Rápidos no Topo -->
+    <div class="grid-4">
+        <div class="kpi-card">
+            <div class="kpi-label">⚡ Uso Total de CPU</div>
+            <div class="kpi-value" id="kpiCpu">--%</div>
+            <div class="kpi-sub" id="kpiCpuSub">-- vCPUs | Load: --</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">🧠 Memória RAM Física</div>
+            <div class="kpi-value" id="kpiRam">--%</div>
+            <div class="kpi-sub" id="kpiRamSub">-- / -- (Django: --)</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">📦 Storage de PDFs (Supabase / Local)</div>
+            <div class="kpi-value" id="kpiStorageTotal">--</div>
+            <div class="kpi-sub" id="kpiStorageSub">-- na fila | -- processados</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">🗄️ Banco de Dados (<span id="kpiDbEngine">DB</span>)</div>
+            <div class="kpi-value" id="kpiDbSize">--</div>
+            <div class="kpi-sub" id="kpiDbSub">-- licitações cadastradas</div>
+        </div>
+    </div>
+
+    <!-- Gráficos estilo Gerenciador de Tarefas do Windows (CPU & Memória) -->
+    <div class="grid-2">
+        <div class="card">
+            <h2>
+                <span>📈 Desempenho da CPU (Histórico 60s + Núcleos)</span>
+                <span id="txtCpuFreq" class="badge">-- MHz</span>
+            </h2>
+            <canvas id="canvasCpu" class="sparkline" width="560" height="120"></canvas>
+            <div class="cores-grid" id="gridCores"></div>
+        </div>
+
+        <div class="card">
+            <h2>
+                <span>🧠 Consumo de Memória RAM, Swap & Rede</span>
+                <span id="txtSwapInfo" class="badge">Swap: --</span>
+            </h2>
+            <canvas id="canvasRam" class="sparkline" width="560" height="120"></canvas>
+            <div style="margin-top:14px;">
+                <div style="display:flex; justify-content:space-between; font-size:0.86rem;">
+                    <span>Memória Usada: <strong id="txtRamUsada">--</strong></span>
+                    <span>Disponível: <strong id="txtRamLivre">--</strong> | Cache: <strong id="txtRamCache">--</strong></span>
+                </div>
+                <div class="bar-bg"><div id="barRam" class="bar-fill bar-green" style="width:0%;"></div></div>
+            </div>
+            <div style="margin-top:12px; display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+                <div class="core-box">
+                    <div class="muted">🌐 Tráfego Recebido (RX)</div>
+                    <strong id="txtNetRx" style="font-size:1rem; color:#38bdf8;">--</strong>
+                    <div class="muted" id="txtNetRxRate">Velocidade: 0 KB/s</div>
+                </div>
+                <div class="core-box">
+                    <div class="muted">🌐 Tráfego Enviado (TX)</div>
+                    <strong id="txtNetTx" style="font-size:1rem; color:#a78bfa;">--</strong>
+                    <div class="muted" id="txtNetTxRate">Velocidade: 0 KB/s</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Armazenamento Interno do Supabase/Storage + Discos do Servidor -->
+    <div class="grid-2">
+        <div class="card">
+            <h2>
+                <span>☁️ Armazenamento Interno de PDFs & Banco Supabase</span>
+                <span id="badgeStorageStatus" class="badge">Online</span>
+            </h2>
+            <p class="muted" style="margin-top:-6px;" id="txtStorageTipo">--</p>
+
+            <div class="grid-2" style="margin-bottom:12px;">
+                <div class="disk-item">
+                    <div class="kpi-label">📥 Fila de Entrada (novos_diarios/)</div>
+                    <div style="font-size:1.3rem; font-weight:800; color:#fbbf24; margin-top:4px;" id="txtNovosQtd">0 PDFs</div>
+                    <div class="muted">Espaço ocupado: <strong id="txtNovosBytes" style="color:#f8fafc;">0 B</strong></div>
+                </div>
+                <div class="disk-item">
+                    <div class="kpi-label">✅ Arquivados (diarios_processados/)</div>
+                    <div style="font-size:1.3rem; font-weight:800; color:#34d399; margin-top:4px;" id="txtProcQtd">0 PDFs</div>
+                    <div class="muted">Espaço ocupado: <strong id="txtProcBytes" style="color:#f8fafc;">0 B</strong></div>
+                </div>
+            </div>
+
+            <h3>📅 Distribuição por Mês (diarios_processados/{'{YYYY}/{MM}'})</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Período (Ano/Mês)</th>
+                        <th>Qtd. de Diários</th>
+                        <th>Volume Armazenado</th>
+                    </tr>
+                </thead>
+                <tbody id="tbodyPorMes"></tbody>
+            </table>
+
+            <h3 style="margin-top:16px;">🏷️ Licitações no Banco por Tag Pós-Análise</h3>
+            <div id="boxTagsBanco" style="display:flex; gap:8px; flex-wrap:wrap;"></div>
+        </div>
+
+        <div class="card">
+            <h2>
+                <span>💽 Discos Físicos e Partições do Servidor</span>
+                <span id="txtUptimeSrv" class="badge">Uptime: --</span>
+            </h2>
+            <p class="muted" style="margin-top:-6px;" id="txtHostInfo">--</p>
+            <div id="listaDiscos"></div>
+
+            <h3 style="margin-top:18px;">📄 Últimos Arquivos PDF no Storage</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Arquivo</th>
+                        <th>Local</th>
+                        <th>Tamanho</th>
+                        <th>Data</th>
+                    </tr>
+                </thead>
+                <tbody id="tbodyArquivosRecentes"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Gerenciador de Processos Ativos -->
+    <div class="card">
+        <h2>
+            <span>⚙️ Processos em Execução no Servidor / Container (Top 10 por Consumo)</span>
+            <span id="txtDjangoRss" class="badge">Processo Django: --</span>
+        </h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>PID</th>
+                    <th>Processo</th>
+                    <th>Usuário</th>
+                    <th>Status</th>
+                    <th>% CPU</th>
+                    <th>% RAM</th>
+                    <th>Memória Física (RSS)</th>
+                </tr>
+            </thead>
+            <tbody id="tbodyProcessos"></tbody>
+        </table>
+    </div>
+
+    <script>
+        let dadosAtuais = {snapshot_inicial};
+        let tempoRealAtivo = true;
+        let historicoCpu = [];
+        let historicoRam = [];
+        const MAX_PONTOS = 30;
+        let ultimoRx = null;
+        let ultimoTx = null;
+        let ultimoTempoRede = null;
+
+        function classeCorBarra(pct) {{
+            if (pct >= 85) return "bar-fill bar-red";
+            if (pct >= 70) return "bar-fill bar-amber";
+            return "bar-fill bar-green";
+        }}
+
+        function desenharGrafico(canvasId, dados, corLinha, corFundo) {{
+            const canvas = document.getElementById(canvasId);
+            if (!canvas) return;
+            const ctx = canvas.getContext("2d");
+            const w = canvas.width;
+            const h = canvas.height;
+            ctx.clearRect(0, 0, w, h);
+
+            // Grade de fundo estilo Task Manager
+            ctx.strokeStyle = "#1e293b";
+            ctx.lineWidth = 1;
+            for (let y = 0; y <= h; y += 30) {{
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(w, y);
+                ctx.stroke();
+            }}
+            for (let x = 0; x <= w; x += 40) {{
+                ctx.beginPath();
+                ctx.moveTo(x, 0);
+                ctx.lineTo(x, h);
+                ctx.stroke();
+            }}
+
+            if (dados.length === 0) return;
+
+            const passoX = w / (MAX_PONTOS - 1);
+            ctx.beginPath();
+            dados.forEach((val, idx) => {{
+                const x = idx * passoX;
+                const y = h - (Math.min(Math.max(val, 0), 100) / 100) * (h - 10) - 5;
+                if (idx === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }});
+            ctx.strokeStyle = corLinha;
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+
+            // Preenchimento sob a curva
+            ctx.lineTo((dados.length - 1) * passoX, h);
+            ctx.lineTo(0, h);
+            ctx.closePath();
+            ctx.fillStyle = corFundo;
+            ctx.fill();
+        }}
+
+        function formatarVelocidade(bytesPorSeg) {{
+            if (bytesPorSeg < 1024) return Math.round(bytesPorSeg) + " B/s";
+            if (bytesPorSeg < 1048576) return (bytesPorSeg / 1024).toFixed(1) + " KB/s";
+            return (bytesPorSeg / 1048576).toFixed(2) + " MB/s";
+        }}
+
+        function renderizarDashboard(snap) {{
+            document.getElementById("lblTimestamp").textContent = snap.timestamp;
+            const hw = snap.hardware;
+            const st = snap.storage;
+            const db = snap.banco;
+
+            // Histórico para os gráficos
+            historicoCpu.push(hw.cpu.percent_total);
+            if (historicoCpu.length > MAX_PONTOS) historicoCpu.shift();
+            historicoRam.push(hw.memoria.percent);
+            if (historicoRam.length > MAX_PONTOS) historicoRam.shift();
+
+            desenharGrafico("canvasCpu", historicoCpu, "#38bdf8", "rgba(56, 189, 248, 0.18)");
+            desenharGrafico("canvasRam", historicoRam, "#a78bfa", "rgba(167, 139, 250, 0.18)");
+
+            // KPIs Topo
+            document.getElementById("kpiCpu").textContent = hw.cpu.percent_total + "%";
+            document.getElementById("kpiCpuSub").textContent =
+                `${{hw.cpu.nucleos_logicos}} vCPUs (${{hw.cpu.nucleos_fisicos}} físicos) | Load: ${{hw.sistema.load_avg.join(" / ")}}`;
+
+            document.getElementById("kpiRam").textContent = hw.memoria.percent + "%";
+            document.getElementById("kpiRamSub").textContent =
+                `${{hw.memoria.usado_human}} / ${{hw.memoria.total_human}} (Django: ${{hw.sistema.django_rss_human}})`;
+
+            document.getElementById("kpiStorageTotal").textContent =
+                `${{st.total.human}} (${{st.total.qtd}} PDFs)`;
+            document.getElementById("kpiStorageSub").textContent =
+                `${{st.novos_diarios.qtd}} na fila | ${{st.diarios_processados.qtd}} processados`;
+
+            document.getElementById("kpiDbEngine").textContent = db.engine;
+            document.getElementById("kpiDbSize").textContent = db.tamanho_human;
+            document.getElementById("kpiDbSub").textContent =
+                `${{db.total_licitacoes}} licitação(ões) em '${{db.nome_banco}}'`;
+
+            // CPU por núcleo
+            document.getElementById("txtCpuFreq").textContent = hw.cpu.freq_mhz ? `${{hw.cpu.freq_mhz}} MHz` : `${{hw.cpu.nucleos_logicos}} vCPUs`;
+            const gridCores = document.getElementById("gridCores");
+            gridCores.innerHTML = hw.cpu.per_core.map((pct, i) => `
+                <div class="core-box">
+                    <div style="display:flex; justify-content:space-between;">
+                        <span>Core #${{i}}</span>
+                        <strong>${{pct}}%</strong>
+                    </div>
+                    <div class="bar-bg" style="height:7px; margin:4px 0 0 0;">
+                        <div class="${{classeCorBarra(pct)}}" style="width:${{pct}}%;"></div>
+                    </div>
+                </div>
+            `).join("");
+
+            // Memória & Rede
+            document.getElementById("txtSwapInfo").textContent =
+                `Swap: ${{hw.memoria.swap_usado_human}} / ${{hw.memoria.swap_total_human}} (${{hw.memoria.swap_percent}}%)`;
+            document.getElementById("txtRamUsada").textContent = hw.memoria.usado_human;
+            document.getElementById("txtRamLivre").textContent = hw.memoria.disponivel_human;
+            document.getElementById("txtRamCache").textContent = hw.memoria.cached_human;
+            const barRam = document.getElementById("barRam");
+            barRam.style.width = hw.memoria.percent + "%";
+            barRam.className = classeCorBarra(hw.memoria.percent);
+
+            const agoraMs = Date.now();
+            if (ultimoRx !== null && ultimoTempoRede !== null) {{
+                const dt = Math.max((agoraMs - ultimoTempoRede) / 1000, 0.5);
+                const rxRate = Math.max((hw.rede.bytes_recebidos - ultimoRx) / dt, 0);
+                const txRate = Math.max((hw.rede.bytes_enviados - ultimoTx) / dt, 0);
+                document.getElementById("txtNetRxRate").textContent = "Velocidade: " + formatarVelocidade(rxRate);
+                document.getElementById("txtNetTxRate").textContent = "Velocidade: " + formatarVelocidade(txRate);
+            }}
+            ultimoRx = hw.rede.bytes_recebidos;
+            ultimoTx = hw.rede.bytes_enviados;
+            ultimoTempoRede = agoraMs;
+
+            document.getElementById("txtNetRx").textContent =
+                `${{hw.rede.bytes_recebidos_human}} (${{hw.rede.pacotes_recebidos}} pkts)`;
+            document.getElementById("txtNetTx").textContent =
+                `${{hw.rede.bytes_enviados_human}} (${{hw.rede.pacotes_enviados}} pkts)`;
+
+            // Storage Supabase / Local
+            document.getElementById("txtStorageTipo").textContent = st.tipo_storage;
+            document.getElementById("badgeStorageStatus").textContent = st.status;
+            document.getElementById("txtNovosQtd").textContent = `${{st.novos_diarios.qtd}} arquivo(s) PDF`;
+            document.getElementById("txtNovosBytes").textContent = st.novos_diarios.human;
+            document.getElementById("txtProcQtd").textContent = `${{st.diarios_processados.qtd}} arquivo(s) PDF`;
+            document.getElementById("txtProcBytes").textContent = st.diarios_processados.human;
+
+            const tbodyPorMes = document.getElementById("tbodyPorMes");
+            if (st.por_mes.length === 0) {{
+                tbodyPorMes.innerHTML = `<tr><td colspan="3" class="muted">Nenhum PDF arquivado em diarios_processados/ ainda.</td></tr>`;
+            }} else {{
+                tbodyPorMes.innerHTML = st.por_mes.map(m => `
+                    <tr>
+                        <td><strong>${{m.periodo}}</strong></td>
+                        <td>${{m.qtd}} PDF(s)</td>
+                        <td>${{m.tamanho_human}}</td>
+                    </tr>
+                `).join("");
+            }}
+
+            // Tags no banco
+            const pt = db.por_tag;
+            document.getElementById("boxTagsBanco").innerHTML = `
+                <span class="badge" style="background:#78350f; color:#fde68a;">⭐ Favorito: ${{pt.favorito || 0}}</span>
+                <span class="badge" style="background:#1e3a8a; color:#93c5fd;">🔍 Em Análise: ${{pt.em_analise || 0}}</span>
+                <span class="badge" style="background:#7f1d1d; color:#fecaca;">⚠️ Sem Conformidade: ${{pt.sem_conformidade || 0}}</span>
+                <span class="badge" style="background:#374151; color:#e5e7eb;">🚫 Ignorado: ${{pt.ignorado || 0}}</span>
+                <span class="badge" style="background:#0f172a; color:#cbd5e1; border:1px solid #475569;">⚪ Sem Marcação: ${{pt.sem_marcacao || 0}}</span>
+            `;
+
+            // Discos do Servidor
+            document.getElementById("txtUptimeSrv").textContent = `Uptime: ${{hw.sistema.uptime_sistema_human}}`;
+            document.getElementById("txtHostInfo").textContent =
+                `Host: ${{hw.sistema.hostname}} | OS: ${{hw.sistema.os}} (${{hw.sistema.arquitetura}}) | Python ${{hw.sistema.python_version}} | Modo: ${{hw.sistema.modo_app}}`;
+
+            document.getElementById("listaDiscos").innerHTML = snap.discos.map(d => `
+                <div class="disk-item">
+                    <div style="display:flex; justify-content:space-between; font-size:0.88rem;">
+                        <strong>💿 ${{d.dispositivo}} <span class="muted">(${{d.ponto_montagem}})</span></strong>
+                        <span><strong>${{d.percent}}%</strong> usado (${{d.usado_human}} / ${{d.total_human}} — Livre: ${{d.livre_human}})</span>
+                    </div>
+                    <div class="bar-bg">
+                        <div class="${{classeCorBarra(d.percent)}}" style="width:${{d.percent}}%;"></div>
+                    </div>
+                </div>
+            `).join("");
+
+            // Arquivos recentes
+            const tbodyArq = document.getElementById("tbodyArquivosRecentes");
+            if (st.arquivos_recentes.length === 0) {{
+                tbodyArq.innerHTML = `<tr><td colspan="4" class="muted">Nenhum PDF encontrado no storage.</td></tr>`;
+            }} else {{
+                tbodyArq.innerHTML = st.arquivos_recentes.map(a => `
+                    <tr>
+                        <td><code>${{a.nome}}</code></td>
+                        <td>${{a.pasta}}</td>
+                        <td>${{a.tamanho_human}}</td>
+                        <td>${{a.modificado}}</td>
+                    </tr>
+                `).join("");
+            }}
+
+            // Top Processos
+            document.getElementById("txtDjangoRss").textContent =
+                `Processo Django Atual: ${{hw.sistema.django_rss_human}} (Uptime: ${{hw.sistema.uptime_django_human}})`;
+            document.getElementById("tbodyProcessos").innerHTML = hw.top_processos.map(p => `
+                <tr>
+                    <td><code>${{p.pid}}</code></td>
+                    <td><strong>${{p.name}}</strong></td>
+                    <td>${{p.username}}</td>
+                    <td><span class="badge">${{p.status}}</span></td>
+                    <td><strong>${{p.cpu_percent}}%</strong></td>
+                    <td>${{p.memory_percent}}%</td>
+                    <td>${{p.rss_human}}</td>
+                </tr>
+            `).join("");
+        }}
+
+        async function buscarMetricas(forcarStorage = false) {{
+            try {{
+                const url = forcarStorage
+                    ? "/licitacoes/servidor/metricas/?refresh_storage=1"
+                    : "/licitacoes/servidor/metricas/";
+                const resp = await fetch(url, {{ headers: {{ "X-Requested-With": "XMLHttpRequest" }} }});
+                if (!resp.ok) return;
+                const json = await resp.json();
+                if (json.status === "sucesso" && json.dados) {{
+                    dadosAtuais = json.dados;
+                    renderizarDashboard(dadosAtuais);
+                }}
+            }} catch (e) {{
+                console.warn("Falha ao atualizar métricas:", e);
+            }}
+        }}
+
+        function alternarTempoReal() {{
+            tempoRealAtivo = !tempoRealAtivo;
+            const btn = document.getElementById("btnToggleLive");
+            const badge = document.getElementById("statusLiveBadge");
+            if (tempoRealAtivo) {{
+                btn.textContent = "⏸️ Pausar Tempo Real";
+                badge.textContent = "● AO VIVO (3s)";
+                badge.className = "badge badge-live";
+                buscarMetricas(false);
+            }} else {{
+                btn.textContent = "▶️ Retomar Tempo Real";
+                badge.textContent = "⏸️ PAUSADO";
+                badge.className = "badge";
+            }}
+        }}
+
+        // Inicializa imediatamente e agenda polling a cada 3 segundos
+        renderizarDashboard(dadosAtuais);
+        setInterval(() => {{
+            if (tempoRealAtivo) buscarMetricas(false);
+        }}, 3000);
+    </script>
+</body>
+</html>"""
+    return HttpResponse(pagina_html)
