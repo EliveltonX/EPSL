@@ -197,3 +197,4 @@ def registrar_diario_processado(
         },
     )
     return obj
+
