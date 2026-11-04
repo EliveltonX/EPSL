@@ -33,7 +33,13 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
-from licitacoes.models import Licitacao
+from licitacoes.deduplicacao import (
+    calcular_sha256_bytes,
+    calcular_sha256_texto_pdf,
+    registrar_diario_processado,
+    sincronizar_hashes_locais_existentes,
+)
+from licitacoes.models import DiarioProcessado, Licitacao
 
 logger = logging.getLogger(__name__)
 
@@ -506,6 +512,22 @@ class Command(BaseCommand):
             data_ref=data_ref,
         )
 
+    def _remover_pdf_duplicado_entrada(
+        self,
+        use_local: bool,
+        s3_client: Optional[BaseClient],
+        bucket_name: str,
+        object_key: str,
+    ) -> None:
+        """Remove de `novos_diarios/` um PDF que foi identificado como duplicata de outro já processado."""
+        if use_local:
+            p = Path(object_key)
+            if p.exists():
+                p.unlink()
+            return
+        assert s3_client is not None
+        s3_client.delete_object(Bucket=bucket_name, Key=object_key)
+
     # --------------------------------------------------------------------------
     # Orquestração por Arquivo PDF
     # --------------------------------------------------------------------------
@@ -526,6 +548,44 @@ class Command(BaseCommand):
             object_key=object_key,
         )
 
+        # Passo 0: Deduplicação Dupla (Hash Binário SHA-256 + Hash do Conteúdo Textual Normalizado)
+        sincronizar_hashes_locais_existentes()
+        sha256_arquivo = calcular_sha256_bytes(pdf_bytes)
+        sha256_texto, total_paginas = calcular_sha256_texto_pdf(pdf_bytes)
+
+        duplicado_db = DiarioProcessado.objects.filter(
+            sha256_arquivo=sha256_arquivo
+        ).first()
+        tipo_match = "Hash Binário SHA-256 exato"
+
+        if duplicado_db is None and sha256_texto:
+            duplicado_db = DiarioProcessado.objects.filter(
+                sha256_texto=sha256_texto
+            ).first()
+            tipo_match = "Conteúdo Textual 100% idêntico (mesmo Diário Oficial com outro nome/metadado)"
+
+        if duplicado_db is not None:
+            data_proc_str = duplicado_db.processado_em.strftime("%d/%m/%Y %H:%M")
+            self.stdout.write(
+                self.style.WARNING(
+                    f"   [DUPLICADO BLOQUEADO - ECONOMIA DE IA] O arquivo '{Path(object_key).name}' "
+                    f"é idêntico ao diário já processado '{duplicado_db.nome_arquivo}' "
+                    f"({tipo_match} | Processado em: {data_proc_str}).\n"
+                    f"   -> Envio ao Google Gemini CANCELADO para evitar custo duplicado de IA!"
+                )
+            )
+            if not dry_run:
+                self._remover_pdf_duplicado_entrada(
+                    use_local=use_local,
+                    s3_client=s3_client,
+                    bucket_name=bucket_name,
+                    object_key=object_key,
+                )
+                self.stdout.write(
+                    f"   -> Cópia redundante removida de 'novos_diarios/'. Documento original mantido em: {duplicado_db.link_documento}"
+                )
+            return
+
         # Passo 1: PyMuPDF + Regex
         paginas_promissoras = self._extrair_paginas_promissoras(pdf_bytes)
         nums_paginas = [str(p[0]) for p in paginas_promissoras]
@@ -544,6 +604,15 @@ class Command(BaseCommand):
                     object_key=object_key,
                     processed_prefix=processed_prefix,
                     data_ref=datetime.date.today(),
+                )
+                registrar_diario_processado(
+                    nome_arquivo=Path(link_arquivado).name,
+                    sha256_arquivo=sha256_arquivo,
+                    sha256_texto=sha256_texto,
+                    tamanho_bytes=len(pdf_bytes),
+                    total_paginas=total_paginas,
+                    qtd_licitacoes=0,
+                    link_documento=link_arquivado,
                 )
                 self.stdout.write(
                     f"   PDF arquivado sem ocorrências em: {link_arquivado}"
@@ -588,7 +657,8 @@ class Command(BaseCommand):
             data_ref=data_referencia,
         )
 
-        # Passo 4: Salva os registros estruturados no banco (MySQL em teste / PostgreSQL em deploy)
+        # Passo 4: Salva os registros estruturados no banco e registra o Hash Anti-Duplicata
+        qtd_salvas = 0
         if licitacoes_extraidas:
             objetos_para_salvar = [
                 Licitacao(
@@ -604,10 +674,11 @@ class Command(BaseCommand):
             ]
             with transaction.atomic():
                 Licitacao.objects.bulk_create(objetos_para_salvar)
+                qtd_salvas = len(objetos_para_salvar)
 
             self.stdout.write(
                 self.style.SUCCESS(
-                    f"   [OK] {len(objetos_para_salvar)} licitação(ões) salva(s) | PDF movido para: {link_documento}"
+                    f"   [OK] {qtd_salvas} licitação(ões) salva(s) | PDF movido para: {link_documento}"
                 )
             )
         else:
@@ -616,3 +687,13 @@ class Command(BaseCommand):
                     f"   Gemini analisou as páginas mas descartou como falso-positivo. PDF movido para: {link_documento}"
                 )
             )
+
+        registrar_diario_processado(
+            nome_arquivo=Path(link_documento).name,
+            sha256_arquivo=sha256_arquivo,
+            sha256_texto=sha256_texto,
+            tamanho_bytes=len(pdf_bytes),
+            total_paginas=total_paginas,
+            qtd_licitacoes=qtd_salvas,
+            link_documento=link_documento,
+        )

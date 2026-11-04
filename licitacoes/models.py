@@ -74,3 +74,63 @@ class Licitacao(models.Model):
 
     def __str__(self) -> str:
         return f"[{self.cidade}] {self.modalidade} - {self.orgao_emissor} ({self.data_publicacao})"
+
+
+class DiarioProcessado(models.Model):
+    """
+    Registro de impressão digital (Deduplicação Criptográfica e Textual) de Diários Oficiais já analisados.
+    Impede que o mesmo Diário Oficial (mesmo renomeado por outro funcionário ou re-baixado)
+    seja enviado novamente para análise no Google Gemini, reduzindo custos de IA.
+    """
+
+    nome_arquivo = models.CharField(
+        max_length=255,
+        verbose_name="Nome do Arquivo Original",
+    )
+    sha256_arquivo = models.CharField(
+        max_length=64,
+        unique=True,
+        db_index=True,
+        verbose_name="SHA-256 Binário do Arquivo",
+        help_text="Hash SHA-256 exato dos bytes do arquivo PDF.",
+    )
+    sha256_texto = models.CharField(
+        max_length=64,
+        db_index=True,
+        blank=True,
+        default="",
+        verbose_name="SHA-256 do Texto Normalizado",
+        help_text="Hash SHA-256 do conteúdo textual extraído pelo PyMuPDF (detecta diários iguais mesmo com metadados PDF diferentes).",
+    )
+    tamanho_bytes = models.BigIntegerField(
+        default=0,
+        verbose_name="Tamanho (Bytes)",
+    )
+    total_paginas = models.PositiveIntegerField(
+        default=0,
+        verbose_name="Total de Páginas",
+    )
+    qtd_licitacoes_extraidas = models.PositiveIntegerField(
+        default=0,
+        verbose_name="Licitações Extraídas",
+    )
+    link_documento = models.URLField(
+        max_length=500,
+        blank=True,
+        default="",
+        verbose_name="Link do Documento Arquivado",
+    )
+    processado_em = models.DateTimeField(
+        auto_now_add=True,
+        db_index=True,
+        verbose_name="Processado em",
+    )
+
+    class Meta:
+        db_table = "diarios_processados_hash"
+        verbose_name = "Diário Processado (Hash Anti-Duplicata)"
+        verbose_name_plural = "Diários Processados (Hashes Anti-Duplicata)"
+        ordering = ["-processado_em"]
+
+    def __str__(self) -> str:
+        return f"{self.nome_arquivo} ({self.sha256_arquivo[:12]}...)"

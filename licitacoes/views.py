@@ -785,7 +785,8 @@ def pagina_upload_diarios(request: HttpRequest) -> HttpResponse:
         <div class="info-box">
             <strong>⚡ Arquitetura Desacoplada (Zero Travamento):</strong> {html.escape(modo_arquitetura)}<br>
             • Os arquivos PDF são enviados em paralelo diretamente para a pasta <code>novos_diarios/</code> <strong>sem disparar a IA durante o upload</strong>.<br>
-            • <strong>Proteção Anti-Colisão:</strong> Caso você envie um PDF com o mesmo nome de outro já existente em <code>novos_diarios/</code> ou em <code>diarios_processados/</code>, ele será renomeado automaticamente (ex: <code>diario_2.pdf</code>) para nunca sobrescrever documentos antigos.
+            • <strong>🛡️ Proteção Anti-Duplicata (Economia de IA):</strong> O sistema calcula a impressão digital criptográfica (<code>SHA-256</code>) de cada PDF antes do envio. Se dois funcionários enviarem o <strong>mesmo Diário Oficial (mesmo com nomes de arquivo diferentes)</strong>, o sistema reconhece que o conteúdo é idêntico e bloqueia o reenvio automaticamente!<br>
+            • <strong>Proteção Anti-Colisão de Nomes:</strong> Caso você envie um PDF inédito que por coincidência tenha o mesmo nome de outro arquivo antigo, ele será renomeado automaticamente (ex: <code>diario_2.pdf</code>).
         </div>
 
         <div id="dropzone" class="dropzone" onclick="document.getElementById('fileInput').click()">
@@ -841,13 +842,28 @@ def pagina_upload_diarios(request: HttpRequest) -> HttpResponse:
             return (bytes / 1048576).toFixed(2) + " MB";
         }}
 
+        async function calcularSha256Arquivo(file) {{
+            try {{
+                if (!window.crypto || !window.crypto.subtle) return "";
+                const buffer = await file.arrayBuffer();
+                const hashBuffer = await window.crypto.subtle.digest("SHA-256", buffer);
+                const hashArray = Array.from(new Uint8Array(hashBuffer));
+                return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+            }} catch (e) {{
+                return "";
+            }}
+        }}
+
         function adicionarArquivos(fileList) {{
             for (const file of fileList) {{
                 if (!file.name.toLowerCase().endsWith(".pdf")) continue;
                 filaArquivos.push({{
                     file: file,
+                    sha256: "",
                     nomeFinal: "Aguardando verificação...",
                     foiRenomeado: false,
+                    duplicado: false,
+                    motivoDuplicado: "",
                     progresso: 0,
                     status: "Na fila",
                     concluido: false
@@ -883,20 +899,24 @@ def pagina_upload_diarios(request: HttpRequest) -> HttpResponse:
             resumo.textContent = `${{filaArquivos.length}} arquivo(s) PDF preparado(s) para envio.`;
 
             corpo.innerHTML = filaArquivos.map((item, idx) => {{
-                const badgeRename = item.foiRenomeado
-                    ? `<span class="badge badge-renamed" title="Renomeado automaticamente para evitar conflito">Renomeado: ${{item.nomeFinal}}</span>`
-                    : `<code>${{item.nomeFinal}}</code>`;
+                let badgeDestino = `<code>${{item.nomeFinal}}</code>`;
+                if (item.duplicado) {{
+                    badgeDestino = `<span class="badge badge-err" title="${{item.motivoDuplicado}}">🚫 ${{item.motivoDuplicado}}</span>`;
+                }} else if (item.foiRenomeado) {{
+                    badgeDestino = `<span class="badge badge-renamed" title="Renomeado automaticamente para evitar conflito">Renomeado: ${{item.nomeFinal}}</span>`;
+                }}
+                const badgeStatusCls = item.duplicado ? "badge badge-err" : (item.concluido ? "badge badge-ok" : "badge");
                 return `
                     <tr>
                         <td><strong>${{item.file.name}}</strong></td>
-                        <td id="nome-final-${{idx}}">${{badgeRename}}</td>
+                        <td id="nome-final-${{idx}}">${{badgeDestino}}</td>
                         <td>${{formatarBytes(item.file.size)}}</td>
                         <td>
                             <div class="progress-wrap">
-                                <div id="prog-${{idx}}" class="progress-bar" style="width:${{item.progresso}}%;"></div>
+                                <div id="prog-${{idx}}" class="progress-bar" style="width:${{item.progresso}}%; ${{item.duplicado ? 'background:#ef4444;' : ''}}"></div>
                             </div>
                         </td>
-                        <td id="status-${{idx}}"><span class="badge">${{item.status}}</span></td>
+                        <td id="status-${{idx}}"><span class="${{badgeStatusCls}}">${{item.status}}</span></td>
                     </tr>
                 `;
             }}).join("");
@@ -911,7 +931,20 @@ def pagina_upload_diarios(request: HttpRequest) -> HttpResponse:
 
             document.getElementById("btnIniciarUpload").disabled = true;
 
-            // 1. Pede ao Django apenas as URLs pré-assinadas e nomes únicos (sem enviar os bytes ainda)
+            // 1. Calcula o hash SHA-256 de cada arquivo no navegador e pede as URLs pré-assinadas ao Django
+            for (const p of pendentes) {{
+                if (!p.item.sha256) {{
+                    p.item.status = "Verificando autenticidade (SHA-256)...";
+                }}
+            }}
+            renderizarTabela();
+
+            for (const p of pendentes) {{
+                if (!p.item.sha256) {{
+                    p.item.sha256 = await calcularSha256Arquivo(p.item.file);
+                }}
+            }}
+
             const resp = await fetch("/licitacoes/upload/presign/", {{
                 method: "POST",
                 headers: {{
@@ -919,7 +952,10 @@ def pagina_upload_diarios(request: HttpRequest) -> HttpResponse:
                     "X-CSRFToken": csrfToken
                 }},
                 body: JSON.stringify({{
-                    filenames: pendentes.map(p => p.item.file.name)
+                    arquivos: pendentes.map(p => ({{
+                        filename: p.item.file.name,
+                        sha256: p.item.sha256
+                    }}))
                 }})
             }});
 
@@ -930,29 +966,40 @@ def pagina_upload_diarios(request: HttpRequest) -> HttpResponse:
                 return;
             }}
 
-            // Atualiza os nomes finais (e se foram renomeados)
+            // Atualiza os nomes finais, renomeações e bloqueia arquivos duplicados
+            const aptosParaEnvio = [];
             dados.arquivos.forEach((info, i) => {{
                 const idx = pendentes[i].index;
                 filaArquivos[idx].nomeFinal = info.nome_final;
                 filaArquivos[idx].foiRenomeado = info.foi_renomeado;
+                filaArquivos[idx].duplicado = Boolean(info.duplicado);
+                filaArquivos[idx].motivoDuplicado = info.motivo_duplicado || "";
                 filaArquivos[idx].uploadUrl = info.upload_url;
                 filaArquivos[idx].method = info.method;
+
+                if (info.duplicado) {{
+                    filaArquivos[idx].concluido = true;
+                    filaArquivos[idx].progresso = 100;
+                    filaArquivos[idx].status = "Duplicado Bloqueado";
+                }} else {{
+                    aptosParaEnvio.push(pendentes[i]);
+                }}
             }});
             renderizarTabela();
 
-            // 2. Faz o envio direto em paralelo (máximo 3 simultâneos para estabilidade de rede)
+            // 2. Faz o envio direto em paralelo apenas dos arquivos inéditos (máximo 3 simultâneos)
             const limiteConcorrencia = 3;
             let cursor = 0;
 
             async function worker() {{
-                while (cursor < pendentes.length) {{
-                    const atual = pendentes[cursor++];
+                while (cursor < aptosParaEnvio.length) {{
+                    const atual = aptosParaEnvio[cursor++];
                     await enviarArquivoDireto(atual.index);
                 }}
             }}
 
             const workers = [];
-            for (let i = 0; i < Math.min(limiteConcorrencia, pendentes.length); i++) {{
+            for (let i = 0; i < Math.min(limiteConcorrencia, aptosParaEnvio.length); i++) {{
                 workers.push(worker());
             }}
             await Promise.all(workers);
@@ -1019,20 +1066,20 @@ def pagina_upload_diarios(request: HttpRequest) -> HttpResponse:
 @require_POST
 def gerar_urls_upload_presign(request: HttpRequest) -> JsonResponse:
     """
-    Recebe uma lista JSON de nomes de arquivos (`{"filenames": ["a.pdf", "b.pdf"]}`)
-    e retorna as URLs de upload direto (S3 Presigned PUT ou Stream Local) já com
-    verificação anti-colisão (`_2.pdf`, `_3.pdf`).
+    Recebe uma lista JSON de arquivos (`{"arquivos": [{"filename": "a.pdf", "sha256": "..."}]}`
+    ou `{"filenames": ["a.pdf", "b.pdf"]}`) e retorna as URLs de upload direto
+    já com verificação anti-duplicata (SHA-256) e anti-colisão de nomes (`_2.pdf`, `_3.pdf`).
     """
     try:
         payload = json.loads(request.body.decode("utf-8"))
-        filenames = payload.get("filenames", [])
-        if not isinstance(filenames, list) or not filenames:
+        lista_entrada = payload.get("arquivos") or payload.get("filenames") or []
+        if not isinstance(lista_entrada, list) or not lista_entrada:
             return JsonResponse(
                 {"status": "erro", "mensagem": "Informe uma lista de arquivos PDF válida."},
                 status=400,
             )
 
-        instrucoes = gerar_lote_urls_upload([str(f) for f in filenames])
+        instrucoes = gerar_lote_urls_upload(lista_entrada)
         return JsonResponse({"status": "sucesso", "arquivos": instrucoes})
     except Exception as exc:
         return JsonResponse(

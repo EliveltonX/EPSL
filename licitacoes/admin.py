@@ -1,5 +1,5 @@
 from django.contrib import admin
-from licitacoes.models import Licitacao
+from licitacoes.models import DiarioProcessado, Licitacao
 
 
 @admin.register(Licitacao)
@@ -17,3 +17,17 @@ class LicitacaoAdmin(admin.ModelAdmin):
     list_filter = ("tag_analise", "cidade", "modalidade", "data_publicacao")
     search_fields = ("cidade", "orgao_emissor", "objeto_licitacao")
     date_hierarchy = "data_publicacao"
+
+
+@admin.register(DiarioProcessado)
+class DiarioProcessadoAdmin(admin.ModelAdmin):
+    list_display = (
+        "nome_arquivo",
+        "sha256_arquivo",
+        "total_paginas",
+        "qtd_licitacoes_extraidas",
+        "tamanho_bytes",
+        "processado_em",
+    )
+    search_fields = ("nome_arquivo", "sha256_arquivo", "sha256_texto")
+    readonly_fields = ("sha256_arquivo", "sha256_texto", "processado_em")
