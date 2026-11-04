@@ -16,6 +16,7 @@ from django.http import (
     HttpResponseRedirect,
     JsonResponse,
 )
+from django.shortcuts import get_object_or_404
 from django.middleware.csrf import get_token
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
@@ -191,15 +192,48 @@ def logout_view(request: HttpRequest) -> HttpResponseRedirect:
     return HttpResponseRedirect("/")
 
 
+TAG_META = {
+    "": {"label": "Sem Marcação", "icon": "⚪", "cls": "tag-none"},
+    "favorito": {"label": "Favorito", "icon": "⭐", "cls": "tag-favorito"},
+    "em_analise": {"label": "Em Análise", "icon": "🔍", "cls": "tag-analise"},
+    "sem_conformidade": {
+        "label": "Sem Conformidade",
+        "icon": "⚠️",
+        "cls": "tag-inconformidade",
+    },
+    "ignorado": {"label": "Ignorado", "icon": "🚫", "cls": "tag-ignorado"},
+}
+
+
+def _render_select_tag(item_id: int, current_tag: str) -> str:
+    """Renderiza o seletor colorido da 1ª coluna da tabela com stopPropagation."""
+    meta = TAG_META.get(current_tag, TAG_META[""])
+    opcoes_html = ""
+    for val, info in TAG_META.items():
+        selected = "selected" if val == current_tag else ""
+        opcoes_html += (
+            f'<option value="{val}" {selected}>{info["icon"]} {info["label"]}</option>'
+        )
+    return (
+        f'<select id="tag-select-{item_id}" class="tag-select {meta["cls"]}" '
+        f'onclick="event.stopPropagation();" '
+        f'onchange="atualizarTagLinha(event, {item_id}, this)">'
+        f"{opcoes_html}</select>"
+    )
+
+
 @login_required
 @ensure_csrf_cookie
 @require_GET
 def painel_licitacoes(request: HttpRequest) -> HttpResponse:
     """
     Página interna protegida (`/licitacoes/`) acessível apenas para usuários logados.
-    Permite consultar e filtrar as licitações extraídas e disparar o processamento manual.
+    Permite consultar, filtrar por busca textual e por Tag de Análise, marcar tags
+    na 1ª coluna e clicar em qualquer linha para abrir a Página de Detalhes.
     """
     busca = request.GET.get("q", "").strip()
+    filtro_tag = request.GET.get("tag", "todas").strip()
+
     qs = Licitacao.objects.all()
     if busca:
         qs = qs.filter(
@@ -209,6 +243,11 @@ def painel_licitacoes(request: HttpRequest) -> HttpResponse:
             | Q(objeto_licitacao__icontains=busca)
         )
 
+    if filtro_tag == "sem_marcacao":
+        qs = qs.filter(tag_analise="")
+    elif filtro_tag in ("favorito", "em_analise", "sem_conformidade", "ignorado"):
+        qs = qs.filter(tag_analise=filtro_tag)
+
     licitacoes = qs[:100]
     csrf_token = get_token(request)
     busca_esc = html.escape(busca)
@@ -216,22 +255,50 @@ def painel_licitacoes(request: HttpRequest) -> HttpResponse:
 
     linhas_html = ""
     for item in licitacoes:
+        select_tag_html = _render_select_tag(item.id, item.tag_analise)
+        objeto_resumo = (
+            item.objeto_licitacao[:180] + "..."
+            if len(item.objeto_licitacao) > 180
+            else item.objeto_licitacao
+        )
         linhas_html += f"""
-        <tr>
+        <tr class="clickable-row" onclick="window.location.href='/licitacoes/{item.id}/'" title="Clique na linha para abrir os detalhes completos desta licitação">
+            <td onclick="event.stopPropagation();">{select_tag_html}</td>
             <td><strong>{html.escape(item.cidade)}</strong></td>
             <td>{html.escape(item.orgao_emissor)}</td>
             <td>{item.data_publicacao.strftime('%d/%m/%Y')}</td>
             <td><span class="badge">{html.escape(item.modalidade)}</span></td>
-            <td>{html.escape(item.objeto_licitacao)}</td>
+            <td>{html.escape(objeto_resumo)}</td>
             <td>{html.escape(item.paginas_referencia)}</td>
-            <td><a href="{html.escape(item.link_documento)}" target="_blank" rel="noopener">Abrir PDF</a></td>
+            <td onclick="event.stopPropagation();">
+                <a href="{html.escape(item.link_documento)}" target="_blank" rel="noopener">Abrir PDF</a>
+            </td>
         </tr>
         """
 
     if not linhas_html:
         linhas_html = (
-            '<tr><td colspan="7" style="text-align:center; padding: 24px; color: #6b7280;">'
-            "Nenhuma licitação encontrada no banco de dados.</td></tr>"
+            '<tr><td colspan="8" style="text-align:center; padding: 28px; color: #6b7280;">'
+            "Nenhuma licitação encontrada para os filtros selecionados.</td></tr>"
+        )
+
+    opcoes_filtro = [
+        ("todas", "🏷️ Todas as Tags"),
+        ("favorito", "⭐ Favorito"),
+        ("em_analise", "🔍 Em Análise"),
+        ("sem_conformidade", "⚠️ Sem Conformidade"),
+        ("ignorado", "🚫 Ignorado"),
+        ("sem_marcacao", "⚪ Sem Marcação"),
+    ]
+    select_filtro_html = ""
+    chips_filtro_html = ""
+    for val, texto in opcoes_filtro:
+        sel = "selected" if filtro_tag == val else ""
+        active_cls = "chip-active" if filtro_tag == val else ""
+        select_filtro_html += f'<option value="{val}" {sel}>{texto}</option>'
+        chips_filtro_html += (
+            f'<a href="/licitacoes/?q={quote_plus_safe(busca)}&tag={val}" '
+            f'class="chip {active_cls}">{texto}</a>'
         )
 
     pagina_html = f"""<!DOCTYPE html>
@@ -240,18 +307,31 @@ def painel_licitacoes(request: HttpRequest) -> HttpResponse:
     <meta charset="utf-8">
     <title>Painel de Licitações — EPSL</title>
     <style>
-        body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 1180px; margin: 30px auto; padding: 0 20px; color: #1f2937; background: #f3f4f6; }}
+        body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 1240px; margin: 30px auto; padding: 0 20px; color: #1f2937; background: #f3f4f6; }}
         .topbar {{ display: flex; justify-content: space-between; align-items: center; background: #ffffff; padding: 16px 24px; border-radius: 12px; border: 1px solid #e5e7eb; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }}
         .card {{ background: #ffffff; padding: 24px; border-radius: 12px; border: 1px solid #e5e7eb; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 0.92rem; }}
-        th, td {{ border-bottom: 1px solid #e5e7eb; padding: 12px 10px; text-align: left; vertical-align: top; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 0.91rem; }}
+        th, td {{ border-bottom: 1px solid #e5e7eb; padding: 12px 10px; text-align: left; vertical-align: middle; }}
         th {{ background: #f9fafb; font-weight: 600; }}
+        tr.clickable-row {{ cursor: pointer; transition: background 0.15s; }}
+        tr.clickable-row:hover {{ background: #eff6ff; }}
         .badge {{ display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 0.8rem; background: #dbeafe; color: #1e40af; font-weight: 600; }}
         .btn {{ display: inline-block; padding: 8px 14px; border-radius: 8px; font-weight: 600; font-size: 0.9rem; text-decoration: none; border: none; cursor: pointer; }}
         .btn-primary {{ background: #2563eb; color: #fff; }}
         .btn-secondary {{ background: #e5e7eb; color: #1f2937; }}
-        .search-bar {{ display: flex; gap: 8px; margin-bottom: 12px; }}
-        .search-bar input {{ flex: 1; padding: 9px 12px; border: 1px solid #d1d5db; border-radius: 8px; }}
+        .search-bar {{ display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }}
+        .search-bar input {{ flex: 1; min-width: 220px; padding: 9px 12px; border: 1px solid #d1d5db; border-radius: 8px; }}
+        .search-bar select {{ padding: 9px 12px; border: 1px solid #d1d5db; border-radius: 8px; background: #fff; font-weight: 600; }}
+        .chips-bar {{ display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }}
+        .chip {{ padding: 5px 12px; border-radius: 999px; font-size: 0.83rem; font-weight: 600; background: #f3f4f6; color: #374151; border: 1px solid #d1d5db; text-decoration: none; }}
+        .chip:hover {{ background: #e5e7eb; }}
+        .chip-active {{ background: #1e40af; color: #ffffff !important; border-color: #1e40af; }}
+        .tag-select {{ padding: 6px 8px; border-radius: 8px; font-size: 0.82rem; font-weight: 600; border: 1px solid #d1d5db; cursor: pointer; }}
+        .tag-none {{ background: #f9fafb; color: #4b5563; }}
+        .tag-favorito {{ background: #fef3c7; color: #92400e; border-color: #f59e0b; }}
+        .tag-analise {{ background: #dbeafe; color: #1e40af; border-color: #3b82f6; }}
+        .tag-inconformidade {{ background: #fee2e2; color: #991b1b; border-color: #ef4444; }}
+        .tag-ignorado {{ background: #e5e7eb; color: #374151; border-color: #9ca3af; }}
         a {{ color: #2563eb; font-weight: 600; text-decoration: none; }}
     </style>
 </head>
@@ -275,13 +355,24 @@ def painel_licitacoes(request: HttpRequest) -> HttpResponse:
     <div class="card">
         <form method="get" action="/licitacoes/" class="search-bar">
             <input type="text" name="q" value="{busca_esc}" placeholder="Filtrar por cidade, órgão emissor, modalidade ou objeto...">
-            <button type="submit" class="btn btn-primary">Buscar</button>
+            <select name="tag">
+                {select_filtro_html}
+            </select>
+            <button type="submit" class="btn btn-primary">Buscar / Filtrar</button>
             <a href="/licitacoes/" class="btn btn-secondary">Limpar</a>
         </form>
+
+        <div class="chips-bar">
+            {chips_filtro_html}
+        </div>
+        <p style="margin: 4px 0 8px 0; font-size: 0.84rem; color: #6b7280;">
+            💡 <strong>Dica:</strong> Clique em qualquer linha da tabela para abrir a <strong>Página de Detalhes</strong> da licitação, ou altere a Tag diretamente na 1ª coluna.
+        </p>
 
         <table>
             <thead>
                 <tr>
+                    <th style="width:175px;">Tag / Situação</th>
                     <th>Cidade</th>
                     <th>Órgão Emissor</th>
                     <th>Publicação</th>
@@ -296,9 +387,235 @@ def painel_licitacoes(request: HttpRequest) -> HttpResponse:
             </tbody>
         </table>
     </div>
+
+    <script>
+        const csrfToken = "{csrf_token}";
+        const classesPorTag = {{
+            "": "tag-none",
+            "favorito": "tag-favorito",
+            "em_analise": "tag-analise",
+            "sem_conformidade": "tag-inconformidade",
+            "ignorado": "tag-ignorado"
+        }};
+
+        async function atualizarTagLinha(event, licitacaoId, selectEl) {{
+            event.stopPropagation();
+            const novaTag = selectEl.value;
+            selectEl.className = "tag-select " + (classesPorTag[novaTag] || "tag-none");
+
+            try {{
+                await fetch(`/licitacoes/${{licitacaoId}}/tag/`, {{
+                    method: "POST",
+                    headers: {{
+                        "Content-Type": "application/json",
+                        "X-CSRFToken": csrfToken,
+                        "X-Requested-With": "XMLHttpRequest"
+                    }},
+                    body: JSON.stringify({{ tag_analise: novaTag }})
+                }});
+            }} catch (err) {{
+                alert("Erro ao salvar a tag: " + err);
+            }}
+        }}
+    </script>
 </body>
 </html>"""
     return HttpResponse(pagina_html)
+
+
+def quote_plus_safe(val: str) -> str:
+    from urllib.parse import quote_plus
+
+    return quote_plus(val)
+
+
+@login_required
+@ensure_csrf_cookie
+@require_GET
+def detalhe_licitacao(request: HttpRequest, pk: int) -> HttpResponse:
+    """
+    Página de Detalhes (`/licitacoes/<int:pk>/`) para visualização aprofundada
+    de uma licitação e marcação de sua Tag pós-análise (`Favorito`, `Em Análise`,
+    `Sem Conformidade`, `Ignorado`).
+    """
+    item = get_object_or_404(Licitacao, pk=pk)
+    csrf_token = get_token(request)
+    meta_atual = TAG_META.get(item.tag_analise, TAG_META[""])
+
+    botoes_tags_html = ""
+    for val, info in TAG_META.items():
+        ativo = "tag-btn-active" if item.tag_analise == val else ""
+        botoes_tags_html += f"""
+        <button type="button"
+                onclick="definirTagDetalhe('{val}')"
+                id="btn-tag-{val or 'vazio'}"
+                class="tag-btn {info['cls']} {ativo}">
+            {info['icon']} {info['label']}
+        </button>
+        """
+
+    pagina_html = f"""<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Detalhes da Licitação #{item.id} — {html.escape(item.cidade)} | EPSL</title>
+    <style>
+        * {{ box-sizing: border-box; }}
+        body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 1080px; margin: 30px auto; padding: 0 20px; color: #1f2937; background: #f3f4f6; line-height: 1.6; }}
+        .topbar {{ display: flex; justify-content: space-between; align-items: center; background: #ffffff; padding: 16px 24px; border-radius: 12px; border: 1px solid #e5e7eb; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }}
+        .card {{ background: #ffffff; padding: 28px; border-radius: 12px; border: 1px solid #e5e7eb; margin-bottom: 20px; }}
+        .meta-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin: 20px 0; }}
+        .meta-box {{ background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 16px; }}
+        .meta-label {{ font-size: 0.8rem; color: #6b7280; text-transform: uppercase; font-weight: 700; letter-spacing: 0.03em; }}
+        .meta-value {{ font-size: 1.02rem; font-weight: 600; color: #111827; margin-top: 4px; }}
+        .objeto-box {{ background: #f8fafc; border-left: 4px solid #2563eb; padding: 20px; border-radius: 8px; font-size: 1.05rem; white-space: pre-wrap; color: #1e293b; }}
+        .btn {{ display: inline-block; padding: 9px 16px; border-radius: 8px; font-weight: 600; font-size: 0.92rem; text-decoration: none; border: none; cursor: pointer; }}
+        .btn-primary {{ background: #2563eb; color: #fff; }}
+        .btn-secondary {{ background: #e5e7eb; color: #1f2937; }}
+        .tag-bar {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }}
+        .tag-btn {{ padding: 9px 16px; border-radius: 999px; font-weight: 600; font-size: 0.9rem; cursor: pointer; border: 2px solid transparent; transition: all 0.15s; opacity: 0.78; }}
+        .tag-btn:hover {{ opacity: 1; transform: translateY(-1px); }}
+        .tag-btn-active {{ opacity: 1; border-color: #111827 !important; box-shadow: 0 2px 6px rgba(0,0,0,0.12); }}
+        .tag-none {{ background: #f3f4f6; color: #4b5563; }}
+        .tag-favorito {{ background: #fef3c7; color: #92400e; }}
+        .tag-analise {{ background: #dbeafe; color: #1e40af; }}
+        .tag-inconformidade {{ background: #fee2e2; color: #991b1b; }}
+        .tag-ignorado {{ background: #e5e7eb; color: #374151; }}
+    </style>
+</head>
+<body>
+    <div class="topbar">
+        <div>
+            <strong>🔎 Detalhes da Licitação #{item.id}</strong>
+            <span id="badgeTagAtual" class="tag-btn {meta_atual['cls']}" style="margin-left:10px; padding:4px 12px; opacity:1; cursor:default;">
+                {meta_atual['icon']} {meta_atual['label']}
+            </span>
+        </div>
+        <div style="display:flex; gap:10px;">
+            <a href="/licitacoes/" class="btn btn-secondary">← Voltar para a Lista de Licitações</a>
+            <a href="{html.escape(item.link_documento)}" target="_blank" rel="noopener" class="btn btn-primary">📄 Abrir PDF Original em Nova Aba</a>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2 style="margin-top:0;">🏷️ Classificação / Situação Pós-Análise</h2>
+        <p style="margin:0; color:#6b7280; font-size:0.92rem;">Selecione uma tag abaixo para classificar esta licitação:</p>
+        <div class="tag-bar">
+            {botoes_tags_html}
+        </div>
+        <div id="msgSalvo" style="display:none; margin-top:10px; color:#059669; font-weight:600; font-size:0.9rem;">
+            ✓ Tag atualizada com sucesso!
+        </div>
+    </div>
+
+    <div class="card">
+        <h2 style="margin-top:0;">📋 Informações Gerais da Publicação</h2>
+        <div class="meta-grid">
+            <div class="meta-box">
+                <div class="meta-label">Cidade / Município</div>
+                <div class="meta-value">{html.escape(item.cidade)}</div>
+            </div>
+            <div class="meta-box">
+                <div class="meta-label">Órgão Emissor</div>
+                <div class="meta-value">{html.escape(item.orgao_emissor)}</div>
+            </div>
+            <div class="meta-box">
+                <div class="meta-label">Data de Publicação</div>
+                <div class="meta-value">{item.data_publicacao.strftime('%d/%m/%Y')}</div>
+            </div>
+            <div class="meta-box">
+                <div class="meta-label">Modalidade</div>
+                <div class="meta-value">{html.escape(item.modalidade)}</div>
+            </div>
+            <div class="meta-box">
+                <div class="meta-label">Páginas de Referência no PDF</div>
+                <div class="meta-value">Página(s): {html.escape(item.paginas_referencia)}</div>
+            </div>
+        </div>
+
+        <h3>📝 Objeto Completo da Licitação (Extraído pela IA)</h3>
+        <div class="objeto-box">{html.escape(item.objeto_licitacao)}</div>
+    </div>
+
+    <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+            <h3 style="margin:0;">📖 Visualização do Diário Oficial (Páginas de referência: {html.escape(item.paginas_referencia)})</h3>
+            <a href="{html.escape(item.link_documento)}" target="_blank" rel="noopener" class="btn btn-secondary">Abrir em Tela Cheia ↗</a>
+        </div>
+        <iframe src="{html.escape(item.link_documento)}" style="width:100%; height:620px; border:1px solid #d1d5db; border-radius:8px;"></iframe>
+    </div>
+
+    <script>
+        const csrfToken = "{csrf_token}";
+        const metaPorTag = {{
+            "": {{ label: "Sem Marcação", icon: "⚪", cls: "tag-none" }},
+            "favorito": {{ label: "Favorito", icon: "⭐", cls: "tag-favorito" }},
+            "em_analise": {{ label: "Em Análise", icon: "🔍", cls: "tag-analise" }},
+            "sem_conformidade": {{ label: "Sem Conformidade", icon: "⚠️", cls: "tag-inconformidade" }},
+            "ignorado": {{ label: "Ignorado", icon: "🚫", cls: "tag-ignorado" }}
+        }};
+
+        async function definirTagDetalhe(novaTag) {{
+            const resp = await fetch("/licitacoes/{item.id}/tag/", {{
+                method: "POST",
+                headers: {{
+                    "Content-Type": "application/json",
+                    "X-CSRFToken": csrfToken,
+                    "X-Requested-With": "XMLHttpRequest"
+                }},
+                body: JSON.stringify({{ tag_analise: novaTag }})
+            }});
+
+            if (resp.ok) {{
+                document.querySelectorAll(".tag-bar .tag-btn").forEach(btn => btn.classList.remove("tag-btn-active"));
+                const btnAtivo = document.getElementById("btn-tag-" + (novaTag || "vazio"));
+                if (btnAtivo) btnAtivo.classList.add("tag-btn-active");
+
+                const info = metaPorTag[novaTag] || metaPorTag[""];
+                const badge = document.getElementById("badgeTagAtual");
+                badge.className = "tag-btn " + info.cls;
+                badge.textContent = info.icon + " " + info.label;
+
+                const msg = document.getElementById("msgSalvo");
+                msg.style.display = "block";
+                setTimeout(() => {{ msg.style.display = "none"; }}, 2500);
+            }}
+        }}
+    </script>
+</body>
+</html>"""
+    return HttpResponse(pagina_html)
+
+
+@login_required
+@require_POST
+def atualizar_tag_licitacao(request: HttpRequest, pk: int) -> JsonResponse:
+    """Atualiza a `tag_analise` de uma licitação específica."""
+    item = get_object_or_404(Licitacao, pk=pk)
+    try:
+        payload = json.loads(request.body.decode("utf-8"))
+        nova_tag = str(payload.get("tag_analise", "")).strip()
+    except Exception:
+        nova_tag = request.POST.get("tag_analise", "").strip()
+
+    tags_validas = set(Licitacao.TagAnalise.values)
+    if nova_tag not in tags_validas:
+        return JsonResponse(
+            {"status": "erro", "mensagem": f"Tag inválida: {nova_tag}"},
+            status=400,
+        )
+
+    item.tag_analise = nova_tag
+    item.save(update_fields=["tag_analise"])
+    return JsonResponse(
+        {
+            "status": "sucesso",
+            "id": item.id,
+            "tag_analise": item.tag_analise,
+            "label": item.get_tag_analise_display(),
+        }
+    )
 
 
 @login_required

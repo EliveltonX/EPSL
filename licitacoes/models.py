@@ -8,8 +8,14 @@ class Licitacao(models.Model):
 
     Decisão de Arquitetura:
     - PostgreSQL (Supabase) estritamente relacional, SEM campos JSON.
-    - Possui exclusivamente os 7 campos de negócio definidos na especificação.
     """
+
+    class TagAnalise(models.TextChoices):
+        SEM_MARCACAO = "", "Sem Marcação"
+        FAVORITO = "favorito", "Favorito"
+        EM_ANALISE = "em_analise", "Em Análise"
+        SEM_CONFORMIDADE = "sem_conformidade", "Sem Conformidade"
+        IGNORADO = "ignorado", "Ignorado"
 
     cidade = models.CharField(
         max_length=150,
@@ -46,6 +52,15 @@ class Licitacao(models.Model):
         verbose_name="Link do Documento",
         help_text="URL no Supabase Storage apontando para o PDF em diarios_processados/{YYYY}/{MM}/.",
     )
+    tag_analise = models.CharField(
+        max_length=30,
+        choices=TagAnalise.choices,
+        default=TagAnalise.SEM_MARCACAO,
+        blank=True,
+        db_index=True,
+        verbose_name="Tag de Análise",
+        help_text="Marcação de situação pós-análise (Favorito, Em Análise, Sem Conformidade, Ignorado).",
+    )
 
     class Meta:
         db_table = "licitacoes"
@@ -54,8 +69,8 @@ class Licitacao(models.Model):
         ordering = ["-data_publicacao", "cidade"]
         indexes = [
             models.Index(fields=["cidade", "data_publicacao"], name="idx_licitacao_cidade_data"),
+            models.Index(fields=["tag_analise", "data_publicacao"], name="idx_licitacao_tag_data"),
         ]
 
     def __str__(self) -> str:
         return f"[{self.cidade}] {self.modalidade} - {self.orgao_emissor} ({self.data_publicacao})"
-
