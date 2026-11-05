@@ -132,14 +132,134 @@ def _sanitize_db_host(raw_host: str) -> str:
     return host
 
 
+def _porta_aberta(host: str, port: int, timeout: float = 0.25) -> bool:
+    """Verifica rapidamente se uma porta TCP está aberta e aceitando conexões."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _descobrir_postgres_na_rede_docker(
+    configured_host: str,
+    port: int,
+    db_name: str,
+    db_user: str,
+    db_password: str,
+) -> str | None:
+    """
+    Quando o serviço do Supabase é reiniciado no Coolify, o Docker recria o container
+    `supabase-db` com um novo IP dinâmico na sub-rede Docker (ex: `10.0.1.10` -> `10.0.1.14`),
+    causando `Connection refused` no IP antigo.
+    Esta função varre em paralelo (< 0.3s) as sub-redes `/24` do container e nomes comuns
+    do Docker para localizar automaticamente o novo IP do PostgreSQL.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    prefixos_subrede = set()
+    partes_cfg = configured_host.split(".")
+    if len(partes_cfg) == 4 and all(p.isdigit() for p in partes_cfg):
+        prefixos_subrede.add(".".join(partes_cfg[:3]))
+
+    try:
+        import psutil
+
+        for iface_addrs in psutil.net_if_addrs().values():
+            for snic in iface_addrs:
+                if snic.family == socket.AF_INET and not snic.address.startswith("127."):
+                    partes = snic.address.split(".")
+                    if len(partes) == 4:
+                        prefixos_subrede.add(".".join(partes[:3]))
+    except Exception:
+        pass
+
+    if not prefixos_subrede:
+        prefixos_subrede.add("10.0.1")
+
+    candidatos = [
+        "supabase-db",
+        "db",
+        "postgres",
+        "172.17.0.1",
+        "10.0.0.1",
+    ]
+    for prefixo in sorted(prefixos_subrede):
+        for ultimo_octeto in range(1, 255):
+            ip_cand = f"{prefixo}.{ultimo_octeto}"
+            if ip_cand != configured_host:
+                candidatos.append(ip_cand)
+
+    def _testar_cand(h: str) -> str | None:
+        return h if _porta_aberta(h, port, timeout=0.22) else None
+
+    hosts_com_porta_5432 = []
+    with ThreadPoolExecutor(max_workers=64) as executor:
+        for res in executor.map(_testar_cand, candidatos):
+            if res:
+                hosts_com_porta_5432.append(res)
+
+    if not hosts_com_porta_5432:
+        return None
+
+    # Valida qual dos hosts encontrados na porta 5432 aceita a autenticação do nosso banco
+    try:
+        import psycopg
+
+        for h in hosts_com_porta_5432:
+            try:
+                conn = psycopg.connect(
+                    host=h,
+                    port=port,
+                    dbname=db_name,
+                    user=db_user,
+                    password=db_password,
+                    connect_timeout=2,
+                )
+                conn.close()
+                return h
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return hosts_com_porta_5432[0]
+
+
 if IS_DEPLOY:
     _raw_db_host = os.getenv("DB_HOST", "localhost")
     _clean_db_host = _sanitize_db_host(_raw_db_host)
     _db_port = int(os.getenv("DB_PORT", "5432").strip() or "5432")
+    _db_name = os.getenv("DB_NAME", "postgres").strip()
+    _db_user = os.getenv("DB_USER", "postgres").strip()
+    _db_password = os.getenv("DB_PASSWORD", "").strip()
     DB_CONNECTION_WARNING = ""
 
-    # Diagnóstico de DNS no log (espaçado para não ser mascarado como <REDACTED> pelo Coolify)
+    # Ignora verificação de rede durante o build da imagem Docker (`collectstatic`)
+    _is_collectstatic = "collectstatic" in sys.argv
     _spaced_host = " ".join(_clean_db_host)
+
+    if not _is_collectstatic and not _porta_aberta(_clean_db_host, _db_port, timeout=1.0):
+        print(
+            f"\n[EPSL-AUTO-DISCOVERY] O host configurado [{_spaced_host}]:{_db_port} recusou conexao "
+            "(provavelmente o container supabase-db trocou de IP ao reiniciar). Buscando novo IP na rede Docker...",
+            file=sys.stderr,
+        )
+        _novo_host = _descobrir_postgres_na_rede_docker(
+            configured_host=_clean_db_host,
+            port=_db_port,
+            db_name=_db_name,
+            db_user=_db_user,
+            db_password=_db_password,
+        )
+        if _novo_host:
+            _spaced_novo = " ".join(_novo_host)
+            print(
+                f"[EPSL-AUTO-DISCOVERY] PostgreSQL localizado automaticamente no novo endereco: [{_spaced_novo}]:{_db_port}!\n",
+                file=sys.stderr,
+            )
+            _clean_db_host = _novo_host
+
     try:
         socket.getaddrinfo(_clean_db_host, _db_port)
         DATABASES = {
@@ -147,9 +267,9 @@ if IS_DEPLOY:
                 "ENGINE": os.getenv(
                     "DB_ENGINE", "django.db.backends.postgresql"
                 ).strip(),
-                "NAME": os.getenv("DB_NAME", "postgres").strip(),
-                "USER": os.getenv("DB_USER", "postgres").strip(),
-                "PASSWORD": os.getenv("DB_PASSWORD", "").strip(),
+                "NAME": _db_name,
+                "USER": _db_user,
+                "PASSWORD": _db_password,
                 "HOST": _clean_db_host,
                 "PORT": str(_db_port),
             }
