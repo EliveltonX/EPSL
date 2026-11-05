@@ -1040,8 +1040,13 @@ def pagina_upload_diarios(request: HttpRequest) -> HttpResponse:
                         }}
                         if (st) st.innerHTML = `<span class="badge badge-ok">✓ Enviado</span>`;
                     }} else {{
-                        item.status = "Erro (" + xhr.status + ")";
-                        if (st) st.innerHTML = `<span class="badge badge-err">Falha (${{xhr.status}})</span>`;
+                        let detalheS3 = "";
+                        try {{
+                            const matchMsg = (xhr.responseText || "").match(/<Message>([^<]+)<\\/Message>/i);
+                            if (matchMsg && matchMsg[1]) detalheS3 = ": " + matchMsg[1];
+                        }} catch (e) {{}}
+                        item.status = "Erro (" + xhr.status + ")" + detalheS3;
+                        if (st) st.innerHTML = `<span class="badge badge-err" title="${{item.status}}">Falha (${{xhr.status}})${{detalheS3}}</span>`;
                     }}
                     resolve();
                 }};
