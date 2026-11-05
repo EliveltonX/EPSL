@@ -40,6 +40,7 @@ from licitacoes.deduplicacao import (
     sincronizar_hashes_locais_existentes,
 )
 from licitacoes.models import DiarioProcessado, Licitacao
+from licitacoes.storage_upload import s3_credenciais_validas
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +143,7 @@ class Command(BaseCommand):
         processed_prefix: str = settings.SUPABASE_PROCESSED_PREFIX
 
         modo_str = (
-            f"TESTE LOCAL (MySQL + Pasta '{settings.LOCAL_STORAGE_ROOT}')"
+            f"TESTE LOCAL (Pasta '{settings.LOCAL_STORAGE_ROOT}')"
             if use_local
             else f"DEPLOY PRODUÇÃO (PostgreSQL Supabase + Bucket '{bucket_name}')"
         )
@@ -156,6 +157,12 @@ class Command(BaseCommand):
         if use_local:
             pdf_keys = self._listar_pdfs_locais(input_prefix, processed_prefix)
         else:
+            if not s3_credenciais_validas():
+                raise RuntimeError(
+                    "As credenciais S3 (SUPABASE_S3_ACCESS_KEY_ID / SUPABASE_S3_SECRET_ACCESS_KEY) "
+                    "ainda estão com os valores de exemplo ('sua-access-key-s3'). "
+                    "Configure as chaves reais do Supabase S3 nas variáveis de ambiente do Coolify."
+                )
             s3_client = self._get_s3_client()
             pdf_keys = self._listar_pdfs_s3(s3_client, bucket_name, input_prefix)
 
@@ -251,7 +258,8 @@ class Command(BaseCommand):
 
         relative_url_path = f"{prefix_limpo}/{ano}/{mes}/{filename}"
         encoded_path = quote(relative_url_path, safe="/")
-        return f"{settings.LOCAL_MEDIA_BASE_URL}/{encoded_path}"
+        base_media = "/media" if settings.IS_DEPLOY else settings.LOCAL_MEDIA_BASE_URL.rstrip("/")
+        return f"{base_media}/{encoded_path}"
 
     # --------------------------------------------------------------------------
     # Métodos Auxiliares: Supabase Storage via S3 / boto3 (Modo Deploy)

@@ -1048,8 +1048,8 @@ def pagina_upload_diarios(request: HttpRequest) -> HttpResponse:
 
                 xhr.onerror = () => {{
                     const st = document.getElementById(`status-${{idx}}`);
-                    item.status = "Erro de Rede/CORS";
-                    if (st) st.innerHTML = `<span class="badge badge-err">Erro de Rede</span>`;
+                    item.status = "Erro de Rede/CORS (S3)";
+                    if (st) st.innerHTML = `<span class="badge badge-err">Erro S3/CORS</span>`;
                     resolve();
                 }};
 
@@ -1092,9 +1092,18 @@ def gerar_urls_upload_presign(request: HttpRequest) -> JsonResponse:
 @require_http_methods(["PUT"])
 def receber_stream_pdf_local(request: HttpRequest, filename: str) -> JsonResponse:
     """
-    Endpoint de escrita direta em stream para o modo de teste local (`storage_local/novos_diarios/`).
-    Grava o corpo binário da requisição PUT direto no disco sem acionar processamento síncrono.
+    Endpoint de escrita direta em stream exclusivo para o modo de teste local (`APP_ENV=test`).
+    Bloqueado em produção (`APP_ENV=deploy`), onde os arquivos vão exclusivamente para o Supabase Storage S3.
     """
+    if not settings.USE_LOCAL_STORAGE:
+        return JsonResponse(
+            {
+                "status": "erro",
+                "mensagem": "Armazenamento local desativado em produção (APP_ENV=deploy). Use exclusivamente o Supabase Storage S3.",
+            },
+            status=403,
+        )
+
     nome_seguro = sanitizar_nome_pdf(filename)
     input_dir = (
         Path(settings.LOCAL_STORAGE_ROOT)

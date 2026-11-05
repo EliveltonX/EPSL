@@ -20,7 +20,7 @@ from django.db import connection
 from django.db.models import Count
 
 from licitacoes.models import Licitacao
-from licitacoes.storage_upload import _obter_s3_client
+from licitacoes.storage_upload import _obter_s3_client, s3_credenciais_validas
 
 # Cache leve em memória para evitar listagens pesadas no S3 a cada 3 segundos de polling
 _STORAGE_CACHE: Dict[str, Any] = {

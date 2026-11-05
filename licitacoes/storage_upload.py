@@ -35,6 +35,33 @@ def sanitizar_nome_pdf(nome_original: str) -> str:
     return f"{stem_limpo[:120]}.pdf"
 
 
+PLACEHOLDER_KEYS = {
+    "",
+    "sua-access-key-s3",
+    "sua-secret-key-s3",
+    "your-access-key",
+    "your-secret-key",
+    "changeme",
+}
+
+
+def s3_credenciais_validas() -> bool:
+    """
+    Retorna True somente se as credenciais S3 do Supabase Storage estiverem preenchidas
+    e NÃO forem os valores de exemplo (`sua-access-key-s3` / `sua-secret-key-s3`).
+    """
+    endpoint = (getattr(settings, "SUPABASE_S3_ENDPOINT_URL", "") or "").strip()
+    access_key = (getattr(settings, "SUPABASE_S3_ACCESS_KEY_ID", "") or "").strip()
+    secret_key = (getattr(settings, "SUPABASE_S3_SECRET_ACCESS_KEY", "") or "").strip()
+    if not endpoint or not access_key or not secret_key:
+        return False
+    if access_key.lower() in PLACEHOLDER_KEYS or secret_key.lower() in PLACEHOLDER_KEYS:
+        return False
+    if "sua-access-key" in access_key.lower() or "sua-secret-key" in secret_key.lower():
+        return False
+    return True
+
+
 def _obter_s3_client() -> BaseClient:
     return boto3.client(
         "s3",
@@ -125,6 +152,12 @@ def gerar_lote_urls_upload(
     bucket_name = settings.SUPABASE_STORAGE_BUCKET
 
     if use_s3:
+        if not s3_credenciais_validas():
+            raise RuntimeError(
+                "As credenciais S3 (SUPABASE_S3_ACCESS_KEY_ID / SUPABASE_S3_SECRET_ACCESS_KEY) "
+                "ainda estão com os valores de exemplo ('sua-access-key-s3'). "
+                "Configure as chaves reais do Supabase S3 nas variáveis de ambiente do Coolify."
+            )
         s3_client = _obter_s3_client()
         nomes_ocupados = _listar_nomes_existentes_s3(s3_client, bucket_name)
     else:

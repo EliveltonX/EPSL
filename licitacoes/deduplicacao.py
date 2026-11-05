@@ -74,7 +74,7 @@ def calcular_sha256_texto_pdf(pdf_bytes: bytes) -> Tuple[str, int]:
 def sincronizar_hashes_locais_existentes() -> None:
     """
     Garante que quaisquer PDFs já arquivados anteriormente em `storage_local/diarios_processados/`
-    (antes da criação da tabela `DiarioProcessado`) tenham seus hashes SHA-256 registrados.
+    (apenas no modo de teste local `APP_ENV=test`) tenham seus hashes SHA-256 registrados.
     """
     if not settings.USE_LOCAL_STORAGE:
         return
@@ -151,7 +151,7 @@ def verificar_duplicidade_por_hash(
                 "origem": "diarios_processados",
             }
 
-    # 3. No modo local, verifica também se já há um arquivo idêntico aguardando na fila `novos_diarios/`
+    # 3. No modo de teste local, verifica também se já há um arquivo idêntico aguardando na fila `novos_diarios/`
     if sha_bin and settings.USE_LOCAL_STORAGE:
         input_dir = (
             Path(settings.LOCAL_STORAGE_ROOT)
