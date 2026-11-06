@@ -1,12 +1,14 @@
 import html
 import io
 import json
+import threading
 from pathlib import Path
 
 from django.conf import settings
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.decorators import login_required
 from django.core.management import call_command
+from django.db import close_old_connections
 from django.db.models import Q
 from django.http import (
     FileResponse,
@@ -23,6 +25,10 @@ from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
 from licitacoes.models import Licitacao
+from licitacoes.pipeline_progress import (
+    iniciar_progresso,
+    obter_snapshot_progresso,
+)
 from licitacoes.server_monitor import obter_snapshot_completo
 from licitacoes.storage_upload import gerar_lote_urls_upload, sanitizar_nome_pdf
 
@@ -348,7 +354,7 @@ def painel_licitacoes(request: HttpRequest) -> HttpResponse:
             <a href="/licitacoes/upload/" class="btn btn-primary" style="background:#059669;">📤 Enviar PDFs (Upload Múltiplo)</a>
             <a href="/licitacoes/servidor/" class="btn btn-secondary">🖥️ Monitor do Servidor</a>
             <a href="/admin/" class="btn btn-secondary">⚙️ Admin</a>
-            <form method="post" action="/licitacoes/processar-web/" style="margin:0;">
+            <form method="post" action="/licitacoes/processar-web/" style="margin:0;" onsubmit="const b=this.querySelector('button'); b.disabled=true; b.textContent='⏳ Iniciando Análise...';">
                 <input type="hidden" name="csrfmiddlewaretoken" value="{csrf_token}">
                 <button type="submit" class="btn btn-primary">▶️ Processar Novos Diários Agora</button>
             </form>
@@ -621,46 +627,232 @@ def atualizar_tag_licitacao(request: HttpRequest, pk: int) -> JsonResponse:
     )
 
 
-@login_required
-@require_POST
-def acionar_processamento_web(request: HttpRequest) -> HttpResponse:
-    """Permite que um usuário logado dispare o comando `processar_diarios` pela interface web."""
+def _executar_pipeline_em_background() -> None:
+    """Executa o management command `processar_diarios` em thread separada atualizando o progresso ao vivo."""
+    close_old_connections()
     out = io.StringIO()
     err = io.StringIO()
-    status_titulo = "Processamento Concluído com Sucesso"
     try:
         call_command("processar_diarios", stdout=out, stderr=err)
-    except Exception as exc:
-        status_titulo = f"Erro durante o processamento: {exc}"
+    except Exception:
+        pass
+    finally:
+        close_old_connections()
 
-    log_str = html.escape(out.getvalue() or "Nenhuma saída registrada.")
-    err_str = html.escape(err.getvalue())
-    bloco_erro = f"<h3>Erros:</h3><pre>{err_str}</pre>" if err_str else ""
+
+@login_required
+@require_GET
+def status_processamento_json(request: HttpRequest) -> JsonResponse:
+    """Retorna o estado atual da barra de progresso, logs, erros e uso das cotas Gemini."""
+    return JsonResponse({"status": "sucesso", "progresso": obter_snapshot_progresso()})
+
+
+@login_required
+@require_http_methods(["GET", "POST"])
+def acionar_processamento_web(request: HttpRequest) -> HttpResponse:
+    """
+    Inicia o processamento de novos diários em background (quando chamado via POST) e
+    exibe imediatamente uma tela interativa com Barra de Carregamento ao Vivo (0% a 100%),
+    contadores em tempo real, tabela de cotas dos modelos Gemini (RPM/RPD) e console de logs/erros.
+    """
+    snap_atual = obter_snapshot_progresso()
+    if request.method == "POST" and not snap_atual.get("em_execucao"):
+        iniciar_progresso(total_arquivos=0)
+        worker = threading.Thread(
+            target=_executar_pipeline_em_background,
+            daemon=True,
+            name="epsl-processar-diarios-worker",
+        )
+        worker.start()
+        snap_atual = obter_snapshot_progresso()
+
+    snap_inicial_json = json.dumps(snap_atual)
 
     return HttpResponse(
         f"""<!DOCTYPE html>
 <html lang="pt-br">
 <head>
     <meta charset="utf-8">
-    <title>Resultado do Processamento — EPSL</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Processando Diários Oficiais — EPSL</title>
     <style>
-        body {{ font-family: system-ui, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 20px; background: #f3f4f6; }}
-        .card {{ background: #fff; padding: 24px; border-radius: 12px; border: 1px solid #e5e7eb; }}
-        pre {{ background: #111827; color: #f9fafb; padding: 16px; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; }}
-        .btn {{ display: inline-block; padding: 10px 16px; background: #2563eb; color: #fff; border-radius: 8px; text-decoration: none; font-weight: 600; }}
+        * {{ box-sizing: border-box; }}
+        body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 1020px; margin: 30px auto; padding: 0 20px; background: #f3f4f6; color: #1f2937; line-height: 1.5; }}
+        .card {{ background: #fff; padding: 24px; border-radius: 12px; border: 1px solid #e5e7eb; margin-bottom: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
+        .progress-outer {{ width: 100%; height: 26px; background: #e5e7eb; border-radius: 999px; overflow: hidden; margin: 14px 0 8px 0; position: relative; }}
+        .progress-inner {{ height: 100%; width: 5%; background: linear-gradient(90deg, #2563eb, #3b82f6); border-radius: 999px; transition: width 0.35s ease, background 0.3s ease; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 0.82rem; font-weight: 700; }}
+        .progress-inner.running {{ background: linear-gradient(90deg, #2563eb 25%, #60a5fa 50%, #2563eb 75%); background-size: 200% 100%; animation: shimmer 1.8s infinite linear; }}
+        @keyframes shimmer {{ 0% {{ background-position: 200% 0; }} 100% {{ background-position: -200% 0; }} }}
+        .kpi-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin: 16px 0; }}
+        .kpi-box {{ background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px 14px; }}
+        .kpi-label {{ font-size: 0.78rem; color: #6b7280; font-weight: 700; text-transform: uppercase; }}
+        .kpi-val {{ font-size: 1.35rem; font-weight: 800; color: #111827; margin-top: 2px; }}
+        pre {{ background: #0f172a; color: #e2e8f0; padding: 16px; border-radius: 10px; overflow-x: auto; white-space: pre-wrap; max-height: 380px; overflow-y: auto; font-size: 0.86rem; margin-top: 8px; }}
+        .err-box {{ background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; padding: 14px 16px; border-radius: 10px; margin-top: 14px; display: none; }}
+        .btn {{ display: inline-block; padding: 10px 16px; background: #2563eb; color: #fff; border-radius: 8px; text-decoration: none; font-weight: 600; border: none; cursor: pointer; }}
+        .btn-secondary {{ background: #4b5563; color: #fff; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 0.86rem; margin-top: 8px; }}
+        th, td {{ border-bottom: 1px solid #e5e7eb; padding: 8px 10px; text-align: left; }}
+        th {{ background: #f9fafb; font-size: 0.76rem; text-transform: uppercase; color: #6b7280; }}
+        .badge {{ display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 0.76rem; font-weight: 700; background: #dbeafe; color: #1e40af; }}
+        .badge-ok {{ background: #d1fae5; color: #065f46; }}
+        .badge-warn {{ background: #fef3c7; color: #92400e; }}
     </style>
 </head>
 <body>
     <div class="card">
-        <h2>{html.escape(status_titulo)}</h2>
-        <h3>Log de Execução:</h3>
-        <pre>{log_str}</pre>
-        {bloco_erro}
-        <p style="margin-top: 20px;">
-            <a href="/licitacoes/" class="btn">← Voltar ao Painel de Licitações</a>
-            <a href="/" class="btn" style="background:#4b5563; margin-left:8px;">🏠 Página Inicial</a>
-        </p>
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+            <h2 id="tituloStatus" style="margin:0;">⏳ Analisando Diários Oficiais em Tempo Real...</h2>
+            <span id="badgeModeloAtivo" class="badge">IA: Carregando...</span>
+        </div>
+
+        <div class="progress-outer">
+            <div id="barraProgresso" class="progress-inner running" style="width:5%;">5%</div>
+        </div>
+        <div style="display:flex; justify-content:space-between; font-size:0.9rem; color:#4b5563; font-weight:600;">
+            <span id="lblArquivoAtual">Preparando fila...</span>
+            <span id="lblEtapaAtual">Conectando ao Storage...</span>
+        </div>
+
+        <div class="kpi-grid">
+            <div class="kpi-box">
+                <div class="kpi-label">📄 Arquivos Processados</div>
+                <div class="kpi-val" id="kpiArquivos">0 / 0</div>
+            </div>
+            <div class="kpi-box">
+                <div class="kpi-label">🏛️ Licitações Extraídas</div>
+                <div class="kpi-val" id="kpiLicitacoes" style="color:#059669;">0</div>
+            </div>
+            <div class="kpi-box">
+                <div class="kpi-label">🛡️ Duplicados Bloqueados</div>
+                <div class="kpi-val" id="kpiDuplicados" style="color:#d97706;">0</div>
+            </div>
+            <div class="kpi-box">
+                <div class="kpi-label">⚠️ Erros Detectados</div>
+                <div class="kpi-val" id="kpiErros" style="color:#dc2626;">0</div>
+            </div>
+        </div>
+
+        <div id="caixaErros" class="err-box">
+            <strong>⚠️ Erros Registrados durante a Execução:</strong>
+            <pre id="preErros" style="background:#7f1d1d; color:#fecaca; max-height:180px; margin-top:8px;"></pre>
+        </div>
+
+        <h3 style="margin-bottom:4px;">🖥️ Console de Execução ao Vivo:</h3>
+        <pre id="preLogs">Iniciando pipeline...</pre>
+
+        <div style="margin-top: 18px; display:flex; gap:10px; flex-wrap:wrap;">
+            <a href="/licitacoes/" class="btn">📄 Voltar ao Painel de Licitações</a>
+            <a href="/licitacoes/upload/" class="btn btn-secondary" style="background:#059669;">📤 Upload de PDFs</a>
+            <a href="/" class="btn btn-secondary">🏠 Página Inicial</a>
+        </div>
     </div>
+
+    <div class="card">
+        <h3 style="margin-top:0;">🤖 Balanceador de Cotas Google Gemini (Ordem de Fallback por Limite RPM/RPD)</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Ordem</th>
+                    <th>Modelo Gemini</th>
+                    <th>Uso por Minuto (RPM)</th>
+                    <th>Tokens/Min (TPM)</th>
+                    <th>Uso Diário (RPD)</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody id="tbodyCotas"></tbody>
+        </table>
+    </div>
+
+    <script>
+        let estado = {snap_inicial_json};
+        let timerPolling = null;
+
+        function atualizarTela(p) {{
+            const pct = Math.max(0, Math.min(100, p.percentual || 0));
+            const barra = document.getElementById("barraProgresso");
+            barra.style.width = Math.max(pct, 4) + "%";
+            barra.textContent = pct + "%";
+
+            document.getElementById("lblArquivoAtual").textContent = p.arquivo_atual || "Aguardando...";
+            document.getElementById("lblEtapaAtual").textContent = p.etapa_atual || "";
+            document.getElementById("badgeModeloAtivo").textContent = "Modelo Ativo: " + (p.modelo_ativo || "gemini-3.5-flash-lite");
+
+            document.getElementById("kpiArquivos").textContent = `${{p.arquivos_processados || 0}} / ${{p.total_arquivos || 0}}`;
+            document.getElementById("kpiLicitacoes").textContent = p.licitacoes_extraidas || 0;
+            document.getElementById("kpiDuplicados").textContent = p.duplicados_bloqueados || 0;
+            document.getElementById("kpiErros").textContent = p.erros_qtd || 0;
+
+            const preLogs = document.getElementById("preLogs");
+            const estavaNoFinal = (preLogs.scrollHeight - preLogs.scrollTop - preLogs.clientHeight) < 40;
+            preLogs.textContent = (p.logs && p.logs.length > 0) ? p.logs.join("\\n") : "Aguardando saída...";
+            if (estavaNoFinal) preLogs.scrollTop = preLogs.scrollHeight;
+
+            const caixaErros = document.getElementById("caixaErros");
+            if (p.erros && p.erros.length > 0) {{
+                caixaErros.style.display = "block";
+                document.getElementById("preErros").textContent = p.erros.join("\\n");
+            }} else {{
+                caixaErros.style.display = "none";
+            }}
+
+            if (p.cotas_modelos) {{
+                document.getElementById("tbodyCotas").innerHTML = p.cotas_modelos.map((c, idx) => {{
+                    const stBadge = c.disponivel
+                        ? `<span class="badge badge-ok">Disponível</span>`
+                        : `<span class="badge badge-warn">Em Cooldown (${{c.em_cooldown_seg}}s)</span>`;
+                    return `
+                        <tr>
+                            <td><strong>#${{idx + 1}}</strong></td>
+                            <td><code>${{c.model}}</code></td>
+                            <td><strong>${{c.rpm_usado}}</strong> / ${{c.rpm_limite}} RPM</td>
+                            <td>${{(c.tpm_limite / 1000)}}K TPM</td>
+                            <td><strong>${{c.rpd_usado}}</strong> / ${{c.rpd_limite}} RPD</td>
+                            <td>${{stBadge}}</td>
+                        </tr>
+                    `;
+                }}).join("");
+            }}
+
+            const titulo = document.getElementById("tituloStatus");
+            if (!p.em_execucao && p.concluido) {{
+                barra.classList.remove("running");
+                if (p.erros_qtd > 0) {{
+                    barra.style.background = "#d97706";
+                    titulo.textContent = "⚠️ Processamento Finalizado com Avisos/Erros";
+                }} else {{
+                    barra.style.background = "#059669";
+                    titulo.textContent = "✅ Processamento Concluído com Sucesso!";
+                }}
+                if (timerPolling) {{
+                    clearInterval(timerPolling);
+                    timerPolling = null;
+                }}
+            }} else {{
+                barra.classList.add("running");
+                titulo.textContent = "⏳ Analisando Diários Oficiais em Tempo Real...";
+            }}
+        }}
+
+        async function consultarStatus() {{
+            try {{
+                const r = await fetch("/licitacoes/processar-web/status/", {{
+                    headers: {{ "X-Requested-With": "XMLHttpRequest" }}
+                }});
+                if (!r.ok) return;
+                const d = await r.json();
+                if (d.status === "sucesso" && d.progresso) {{
+                    atualizarTela(d.progresso);
+                }}
+            }} catch (e) {{}}
+        }}
+
+        atualizarTela(estado);
+        if (estado.em_execucao || !estado.concluido) {{
+            timerPolling = setInterval(consultarStatus, 1000);
+        }}
+    </script>
 </body>
 </html>"""
     )

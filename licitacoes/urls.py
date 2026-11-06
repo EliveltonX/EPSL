@@ -10,6 +10,7 @@ from licitacoes.views import (
     painel_licitacoes,
     painel_servidor,
     receber_stream_pdf_local,
+    status_processamento_json,
 )
 
 urlpatterns = [
@@ -26,5 +27,6 @@ urlpatterns = [
         name="receber_stream_pdf_local",
     ),
     path("processar-web/", acionar_processamento_web, name="processar_diarios_web"),
+    path("processar-web/status/", status_processamento_json, name="status_processamento_json"),
     path("processar/", acionar_processamento_diarios, name="processar_diarios_webhook"),
 ]

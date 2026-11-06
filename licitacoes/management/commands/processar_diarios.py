@@ -18,6 +18,7 @@ import datetime
 import logging
 import re
 import shutil
+import time
 import unicodedata
 from pathlib import Path
 from typing import List, Optional
@@ -40,6 +41,18 @@ from licitacoes.deduplicacao import (
     sincronizar_hashes_locais_existentes,
 )
 from licitacoes.models import DiarioProcessado, Licitacao
+from licitacoes.pipeline_progress import (
+    adicionar_log_progresso,
+    aguardar_slot_rpm_se_necessario,
+    atualizar_etapa_arquivo,
+    concluir_um_arquivo,
+    definir_total_arquivos,
+    finalizar_progresso,
+    iniciar_progresso,
+    ordenar_modelos_para_chamada,
+    registrar_cooldown_modelo,
+    registrar_uso_modelo,
+)
 from licitacoes.storage_upload import s3_credenciais_validas
 
 logger = logging.getLogger(__name__)
@@ -133,10 +146,20 @@ class Command(BaseCommand):
             help="Limita a quantidade máxima de arquivos PDF processados nesta execução (0 = todos).",
         )
 
+    def _log(self, msg: str, style_func=None, is_erro: bool = False) -> None:
+        adicionar_log_progresso(msg, is_erro=is_erro)
+        out_stream = self.stderr if is_erro else self.stdout
+        if style_func is not None:
+            out_stream.write(style_func(msg))
+        else:
+            out_stream.write(msg)
+
     def handle(self, *args, **options) -> None:
         dry_run: bool = options["dry_run"]
         max_files: int = options["max_files"]
         use_local: bool = settings.USE_LOCAL_STORAGE
+
+        iniciar_progresso(total_arquivos=0)
 
         bucket_name: str = settings.SUPABASE_STORAGE_BUCKET
         input_prefix: str = settings.SUPABASE_INPUT_PREFIX
@@ -147,51 +170,73 @@ class Command(BaseCommand):
             if use_local
             else f"DEPLOY PRODUÇÃO (PostgreSQL Supabase + Bucket '{bucket_name}')"
         )
-        self.stdout.write(
-            self.style.NOTICE(
-                f"Iniciando processamento de Diários Oficiais | Modo: {modo_str}"
-            )
+        self._log(
+            f"Iniciando processamento de Diários Oficiais | Modo: {modo_str}",
+            style_func=self.style.NOTICE,
         )
 
-        s3_client: Optional[BaseClient] = None
-        if use_local:
-            pdf_keys = self._listar_pdfs_locais(input_prefix, processed_prefix)
-        else:
-            if not s3_credenciais_validas():
-                raise RuntimeError(
-                    "As credenciais S3 (SUPABASE_S3_ACCESS_KEY_ID / SUPABASE_S3_SECRET_ACCESS_KEY) "
-                    "ainda estão com os valores de exemplo ('sua-access-key-s3'). "
-                    "Configure as chaves reais do Supabase S3 nas variáveis de ambiente do Coolify."
+        try:
+            s3_client: Optional[BaseClient] = None
+            if use_local:
+                pdf_keys = self._listar_pdfs_locais(input_prefix, processed_prefix)
+            else:
+                if not s3_credenciais_validas():
+                    raise RuntimeError(
+                        "As credenciais S3 (SUPABASE_S3_ACCESS_KEY_ID / SUPABASE_S3_SECRET_ACCESS_KEY) "
+                        "ainda estão com os valores de exemplo ('sua-access-key-s3'). "
+                        "Configure as chaves reais do Supabase S3 nas variáveis de ambiente do Coolify."
+                    )
+                s3_client = self._get_s3_client()
+                pdf_keys = self._listar_pdfs_s3(s3_client, bucket_name, input_prefix)
+
+            if not pdf_keys:
+                self._log(
+                    "Nenhum arquivo PDF pendente em 'novos_diarios/'.",
+                    style_func=self.style.SUCCESS,
                 )
-            s3_client = self._get_s3_client()
-            pdf_keys = self._listar_pdfs_s3(s3_client, bucket_name, input_prefix)
+                finalizar_progresso("Concluído (nenhum arquivo pendente na fila).")
+                return
 
-        if not pdf_keys:
-            self.stdout.write(
-                self.style.SUCCESS("Nenhum arquivo PDF pendente em 'novos_diarios/'.")
-            )
-            return
+            if max_files > 0:
+                pdf_keys = pdf_keys[:max_files]
 
-        if max_files > 0:
-            pdf_keys = pdf_keys[:max_files]
+            definir_total_arquivos(len(pdf_keys))
+            self._log(f"Encontrados {len(pdf_keys)} arquivo(s) PDF para processar.")
 
-        self.stdout.write(f"Encontrados {len(pdf_keys)} arquivo(s) PDF para processar.")
+            for idx, object_key in enumerate(pdf_keys, start=1):
+                nome_curto = Path(object_key).name
+                atualizar_etapa_arquivo(idx, nome_curto, "Baixando e lendo PDF...")
+                try:
+                    self._processar_arquivo_pdf(
+                        indice_arquivo=idx,
+                        use_local=use_local,
+                        s3_client=s3_client,
+                        bucket_name=bucket_name,
+                        object_key=object_key,
+                        processed_prefix=processed_prefix,
+                        dry_run=dry_run,
+                    )
+                except Exception as exc:
+                    logger.exception("Erro ao processar o arquivo %s: %s", object_key, exc)
+                    self._log(
+                        f"[ERRO] Falha ao processar '{object_key}': {exc}",
+                        style_func=self.style.ERROR,
+                        is_erro=True,
+                    )
+                    concluir_um_arquivo(teve_erro=True)
+                    if "API_KEY_INVALID" in str(exc) or "COLE_AQUI_SUA_CHAVE" in str(exc):
+                        self._log(
+                            "[PARADA DE SEGURANÇA] Processamento interrompido pois a GEMINI_API_KEY é inválida no servidor.",
+                            style_func=self.style.ERROR,
+                            is_erro=True,
+                        )
+                        break
 
-        for object_key in pdf_keys:
-            try:
-                self._processar_arquivo_pdf(
-                    use_local=use_local,
-                    s3_client=s3_client,
-                    bucket_name=bucket_name,
-                    object_key=object_key,
-                    processed_prefix=processed_prefix,
-                    dry_run=dry_run,
-                )
-            except Exception as exc:
-                logger.exception("Erro ao processar o arquivo %s: %s", object_key, exc)
-                self.stderr.write(
-                    self.style.ERROR(f"[ERRO] Falha ao processar '{object_key}': {exc}")
-                )
+            finalizar_progresso("Processamento concluído!")
+        except Exception as exc:
+            self._log(f"[ERRO FATAL] {exc}", style_func=self.style.ERROR, is_erro=True)
+            finalizar_progresso(f"Interrompido com erro: {exc}")
+            raise
 
     # --------------------------------------------------------------------------
     # Métodos Auxiliares: Armazenamento Local em Pasta (Modo Teste)
@@ -394,20 +439,24 @@ class Command(BaseCommand):
 
     def _extrair_licitacoes_com_gemini(
         self,
+        indice_arquivo: int,
         nome_arquivo: str,
         paginas_promissoras: List[tuple[int, str, List[str]]],
     ) -> List[LicitacaoExtraidaSchema]:
         """
         Envia exclusivamente o texto das páginas pré-filtradas pelo Regex para a API
-        do Google Gemini e retorna a lista estruturada de licitações.
+        do Google Gemini com balanceamento inteligente de cotas (RPM / TPM / RPD)
+        baseado em `Docs_Vault/Arquitetura/ANOTAÇÕES.md`.
         """
-        if not settings.GEMINI_API_KEY:
+        chave_api = (settings.GEMINI_API_KEY or "").strip()
+        if not chave_api or "COLE_AQUI" in chave_api.upper() or "SUA-CHAVE" in chave_api.upper():
             raise RuntimeError(
-                "A variável de ambiente GEMINI_API_KEY não está configurada."
+                "API_KEY_INVALID: A variável GEMINI_API_KEY no Coolify está vazia ou com o texto de exemplo "
+                "('COLE_AQUI_SUA_CHAVE_DO_GEMINI'). Cole sua chave real (AQ.Ab8RN6...) nas Environment Variables do EPSL no Coolify."
             )
 
         client = genai.Client(
-            api_key=settings.GEMINI_API_KEY,
+            api_key=chave_api,
             http_options=types.HttpOptions(
                 retry_options=types.HttpRetryOptions(attempts=1)
             ),
@@ -435,14 +484,34 @@ class Command(BaseCommand):
             f"{conteudo_paginas}"
         )
 
-        modelos_candidatos = []
-        for m in getattr(settings, "GEMINI_FALLBACK_MODELS", [settings.GEMINI_MODEL]):
-            if m and m not in modelos_candidatos:
-                modelos_candidatos.append(m)
-
+        modelos_ordenados = ordenar_modelos_para_chamada()
         response = None
         ultimo_erro = None
-        for modelo_atual in modelos_candidatos:
+
+        for info_modelo in modelos_ordenados:
+            modelo_atual = info_modelo["model"]
+            rpm_limite = info_modelo["rpm_limite"]
+            rpd_limite = info_modelo["rpd_limite"]
+
+            # Se este modelo atingiu o limite por minuto (RPM), verifica se há outro livre; se for o último, aguarda a janela
+            espera_seg = aguardar_slot_rpm_se_necessario(modelo_atual, rpm_limite)
+            if espera_seg > 0:
+                self._log(
+                    f"   [Rate Limit RPM] Aguardando {espera_seg:.1f}s para liberar janela de {rpm_limite} RPM do modelo '{modelo_atual}'..."
+                )
+                atualizar_etapa_arquivo(
+                    indice_arquivo,
+                    nome_arquivo,
+                    f"Aguardando janela de RPM ({espera_seg:.0f}s) para {modelo_atual}...",
+                )
+                time.sleep(espera_seg)
+
+            atualizar_etapa_arquivo(
+                indice_arquivo,
+                nome_arquivo,
+                f"Analisando páginas com IA ({modelo_atual} | Limite: {rpm_limite} RPM / {rpd_limite} RPD)...",
+            )
+
             try:
                 response = client.models.generate_content(
                     model=modelo_atual,
@@ -453,14 +522,27 @@ class Command(BaseCommand):
                         temperature=0.1,
                     ),
                 )
-                self.stdout.write(f"   Extraído com sucesso utilizando o modelo: {modelo_atual}")
+                registrar_uso_modelo(modelo_atual)
+                self._log(
+                    f"   Extraído com sucesso utilizando o modelo: {modelo_atual} "
+                    f"(RPM: {info_modelo['rpm_usado'] + 1}/{rpm_limite} | RPD: {info_modelo['rpd_usado'] + 1}/{rpd_limite})"
+                )
                 break
             except Exception as exc:
                 ultimo_erro = exc
-                self.stdout.write(
-                    self.style.WARNING(
-                        f"   [Aviso] Modelo '{modelo_atual}' indisponível ({exc}). Tentando próximo modelo de fallback..."
-                    )
+                erro_str = str(exc)
+                if "API_KEY_INVALID" in erro_str or "API key not valid" in erro_str:
+                    raise RuntimeError(
+                        "API_KEY_INVALID: A chave GEMINI_API_KEY configurada no Coolify não é válida "
+                        "(verifique se ficou como 'COLE_AQUI_SUA_CHAVE_DO_GEMINI' e substitua por sua chave real 'AQ.Ab8RN6...')."
+                    ) from exc
+
+                # Se for erro 429 (Quota/RPM) ou 503 (High Demand), aplica cooldown no modelo e pula para o próximo da tabela
+                cooldown_seg = 60.0 if "429" in erro_str or "RESOURCE_EXHAUSTED" in erro_str else 25.0
+                registrar_cooldown_modelo(modelo_atual, segundos=cooldown_seg)
+                self._log(
+                    f"   [Fallback de Cota] Modelo '{modelo_atual}' ocupado/limite atingido ({erro_str[:110]}). Alternando para o próximo modelo...",
+                    style_func=self.style.WARNING,
                 )
 
         if response is None:
@@ -541,6 +623,7 @@ class Command(BaseCommand):
     # --------------------------------------------------------------------------
     def _processar_arquivo_pdf(
         self,
+        indice_arquivo: int,
         use_local: bool,
         s3_client: Optional[BaseClient],
         bucket_name: str,
@@ -548,7 +631,8 @@ class Command(BaseCommand):
         processed_prefix: str,
         dry_run: bool = False,
     ) -> None:
-        self.stdout.write(f"\n-> Lendo '{object_key}'...")
+        nome_arquivo = Path(object_key).name
+        self._log(f"\n-> [{indice_arquivo}] Lendo '{object_key}'...")
         pdf_bytes = self._ler_bytes_pdf(
             use_local=use_local,
             s3_client=s3_client,
@@ -557,6 +641,9 @@ class Command(BaseCommand):
         )
 
         # Passo 0: Deduplicação Dupla (Hash Binário SHA-256 + Hash do Conteúdo Textual Normalizado)
+        atualizar_etapa_arquivo(
+            indice_arquivo, nome_arquivo, "Verificando autenticidade SHA-256 (anti-duplicata)..."
+        )
         sincronizar_hashes_locais_existentes()
         sha256_arquivo = calcular_sha256_bytes(pdf_bytes)
         sha256_texto, total_paginas = calcular_sha256_texto_pdf(pdf_bytes)
@@ -574,13 +661,12 @@ class Command(BaseCommand):
 
         if duplicado_db is not None:
             data_proc_str = duplicado_db.processado_em.strftime("%d/%m/%Y %H:%M")
-            self.stdout.write(
-                self.style.WARNING(
-                    f"   [DUPLICADO BLOQUEADO - ECONOMIA DE IA] O arquivo '{Path(object_key).name}' "
-                    f"é idêntico ao diário já processado '{duplicado_db.nome_arquivo}' "
-                    f"({tipo_match} | Processado em: {data_proc_str}).\n"
-                    f"   -> Envio ao Google Gemini CANCELADO para evitar custo duplicado de IA!"
-                )
+            self._log(
+                f"   [DUPLICADO BLOQUEADO - ECONOMIA DE IA] O arquivo '{nome_arquivo}' "
+                f"é idêntico ao diário já processado '{duplicado_db.nome_arquivo}' "
+                f"({tipo_match} | Processado em: {data_proc_str}).\n"
+                f"   -> Envio ao Google Gemini CANCELADO para evitar custo duplicado de IA!",
+                style_func=self.style.WARNING,
             )
             if not dry_run:
                 self._remover_pdf_duplicado_entrada(
@@ -589,20 +675,23 @@ class Command(BaseCommand):
                     bucket_name=bucket_name,
                     object_key=object_key,
                 )
-                self.stdout.write(
+                self._log(
                     f"   -> Cópia redundante removida de 'novos_diarios/'. Documento original mantido em: {duplicado_db.link_documento}"
                 )
+            concluir_um_arquivo(foi_duplicado=True)
             return
 
         # Passo 1: PyMuPDF + Regex
+        atualizar_etapa_arquivo(
+            indice_arquivo, nome_arquivo, f"Filtrando {total_paginas} página(s) com PyMuPDF + Regex..."
+        )
         paginas_promissoras = self._extrair_paginas_promissoras(pdf_bytes)
         nums_paginas = [str(p[0]) for p in paginas_promissoras]
 
         if not paginas_promissoras:
-            self.stdout.write(
-                self.style.WARNING(
-                    f"   Nenhuma página de '{object_key}' conteve palavras-chave do nicho."
-                )
+            self._log(
+                f"   Nenhuma página de '{object_key}' conteve palavras-chave do nicho.",
+                style_func=self.style.WARNING,
             )
             if not dry_run:
                 link_arquivado = self._mover_pdf_processado(
@@ -622,28 +711,28 @@ class Command(BaseCommand):
                     qtd_licitacoes=0,
                     link_documento=link_arquivado,
                 )
-                self.stdout.write(
+                self._log(
                     f"   PDF arquivado sem ocorrências em: {link_arquivado}"
                 )
+            concluir_um_arquivo(licitacoes_adicionadas=0)
             return
 
-        self.stdout.write(
-            self.style.SUCCESS(
-                f"   Filtro Regex encontrou indícios nas páginas: {', '.join(nums_paginas)}"
-            )
+        self._log(
+            f"   Filtro Regex encontrou indícios nas páginas: {', '.join(nums_paginas)}",
+            style_func=self.style.SUCCESS,
         )
 
         if dry_run:
-            self.stdout.write(
-                self.style.NOTICE(
-                    "   [DRY-RUN] Pulando chamada ao Gemini e escrita no banco/Storage."
-                )
+            self._log(
+                "   [DRY-RUN] Pulando chamada ao Gemini e escrita no banco/Storage.",
+                style_func=self.style.NOTICE,
             )
+            concluir_um_arquivo(licitacoes_adicionadas=0)
             return
 
         # Passo 2: Chamada ao Google Gemini com as páginas promissoras
-        nome_arquivo = Path(object_key).name
         licitacoes_extraidas = self._extrair_licitacoes_com_gemini(
+            indice_arquivo=indice_arquivo,
             nome_arquivo=nome_arquivo,
             paginas_promissoras=paginas_promissoras,
         )
@@ -656,6 +745,9 @@ class Command(BaseCommand):
         )
 
         # Passo 3: Move o PDF para diarios_processados/{YYYY}/{MM}/{arquivo.pdf}
+        atualizar_etapa_arquivo(
+            indice_arquivo, nome_arquivo, "Movendo PDF para diarios_processados/ e salvando no banco..."
+        )
         link_documento = self._mover_pdf_processado(
             use_local=use_local,
             s3_client=s3_client,
@@ -684,16 +776,14 @@ class Command(BaseCommand):
                 Licitacao.objects.bulk_create(objetos_para_salvar)
                 qtd_salvas = len(objetos_para_salvar)
 
-            self.stdout.write(
-                self.style.SUCCESS(
-                    f"   [OK] {qtd_salvas} licitação(ões) salva(s) | PDF movido para: {link_documento}"
-                )
+            self._log(
+                f"   [OK] {qtd_salvas} licitação(ões) salva(s) | PDF movido para: {link_documento}",
+                style_func=self.style.SUCCESS,
             )
         else:
-            self.stdout.write(
-                self.style.WARNING(
-                    f"   Gemini analisou as páginas mas descartou como falso-positivo. PDF movido para: {link_documento}"
-                )
+            self._log(
+                f"   Gemini analisou as páginas mas descartou como falso-positivo. PDF movido para: {link_documento}",
+                style_func=self.style.WARNING,
             )
 
         registrar_diario_processado(
@@ -705,3 +795,4 @@ class Command(BaseCommand):
             qtd_licitacoes=qtd_salvas,
             link_documento=link_documento,
         )
+        concluir_um_arquivo(licitacoes_adicionadas=qtd_salvas)

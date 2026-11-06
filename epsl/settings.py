@@ -389,23 +389,32 @@ SUPABASE_INPUT_PREFIX = os.getenv("SUPABASE_INPUT_PREFIX", "novos_diarios/")
 SUPABASE_PROCESSED_PREFIX = os.getenv("SUPABASE_PROCESSED_PREFIX", "diarios_processados/")
 
 # ==============================================================================
-# Google Gemini API & Segurança do Webhook
+# Google Gemini API & Limites de Taxa por Modelo (Docs_Vault/Arquitetura/ANOTAÇÕES.md)
 # ==============================================================================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-_configured_gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
-# Caso o .env ainda tenha o antigo gemini-2.5-flash (descontinuado para novas contas), atualiza automaticamente
-if _configured_gemini_model in ("", "gemini-2.5-flash", "models/gemini-2.5-flash"):
-    GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'").strip()
+_configured_gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+if _configured_gemini_model in (
+    "",
+    "gemini-2.5-flash",
+    "models/gemini-2.5-flash",
+    "gemini-3.8-flash",
+):
+    # Prioriza por padrão o modelo com maior limite diário (500 RPD / 15 RPM) e menor latência
+    GEMINI_MODEL = "gemini-3.5-flash-lite"
 else:
     GEMINI_MODEL = _configured_gemini_model
 
-GEMINI_FALLBACK_MODELS = [
-    GEMINI_MODEL,
-    "gemini-3.8-flash",
-    "gemini-3-flash-preview",
-    "gemini-3.5-flash",
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash-lite",
+# Tabela oficial de cotas ativas da conta Google AI Studio (ordenada por maior RPD/RPM e estabilidade)
+GEMINI_MODELS_QUOTAS = [
+    {"model": "gemini-3.5-flash-lite", "rpm": 15, "tpm": 250_000, "rpd": 500},
+    {"model": "gemini-3.1-flash-lite", "rpm": 15, "tpm": 250_000, "rpd": 500},
+    {"model": "gemini-3.6-flash", "rpm": 5, "tpm": 250_000, "rpd": 20},
+    {"model": "gemini-3-flash-preview", "rpm": 5, "tpm": 250_000, "rpd": 20},
+    {"model": "gemini-3.8-flash", "rpm": 5, "tpm": 250_000, "rpd": 20},
 ]
+
+GEMINI_FALLBACK_MODELS = [item["model"] for item in GEMINI_MODELS_QUOTAS]
+if GEMINI_MODEL not in GEMINI_FALLBACK_MODELS:
+    GEMINI_FALLBACK_MODELS.insert(0, GEMINI_MODEL)
 
 PIPELINE_TRIGGER_TOKEN = os.getenv("PIPELINE_TRIGGER_TOKEN", "")
