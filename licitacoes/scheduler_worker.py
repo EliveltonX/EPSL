@@ -202,3 +202,4 @@ def iniciar_agendador_se_habilitado() -> None:
         name="epsl-cron-10min-scheduler",
     )
     t.start()
+
