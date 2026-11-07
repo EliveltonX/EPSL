@@ -63,6 +63,47 @@ def _url_pdf_com_pagina(url_base: str, pagina: int) -> str:
     return base_sem_hash
 
 
+def _sanitizar_html_anotacoes(raw_html: str) -> str:
+    """
+    Remove tags e atributos potencialmente perigosos (<script>, <iframe>, on*, javascript:)
+    preservando toda a formatação rica de documento estilo Word (fontes, tamanhos, cores,
+    alinhamentos, tabelas, listas numeradas/marcadores e hiperlinks).
+    """
+    if not raw_html:
+        return ""
+    limpo = re.sub(
+        r"<\s*(script|iframe|object|embed|form|meta|link|style)\b[^>]*>.*?<\s*/\s*\1\s*>",
+        "",
+        raw_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    limpo = re.sub(
+        r"<\s*/?\s*(script|iframe|object|embed|form|meta|link)\b[^>]*>",
+        "",
+        limpo,
+        flags=re.IGNORECASE,
+    )
+    limpo = re.sub(
+        r"\s+on[a-z]+\s*=\s*(['\"]).*?\1",
+        "",
+        limpo,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    limpo = re.sub(
+        r"\s+on[a-z]+\s*=\s*[^\s>]+",
+        "",
+        limpo,
+        flags=re.IGNORECASE,
+    )
+    limpo = re.sub(
+        r"(href|src)\s*=\s*(['\"])\s*javascript:.*?\2",
+        r'\1=\2#\2',
+        limpo,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return limpo.strip()
+
+
 @ensure_csrf_cookie
 @require_http_methods(["GET", "POST"])
 def home_status(request: HttpRequest) -> HttpResponse:
@@ -279,6 +320,7 @@ def painel_licitacoes(request: HttpRequest) -> HttpResponse:
             | Q(orgao_emissor__icontains=busca)
             | Q(modalidade__icontains=busca)
             | Q(objeto_licitacao__icontains=busca)
+            | Q(anotacoes__icontains=busca)
         )
 
     if filtro_tag == "sem_marcacao":
@@ -299,6 +341,12 @@ def painel_licitacoes(request: HttpRequest) -> HttpResponse:
             if len(item.objeto_licitacao) > 180
             else item.objeto_licitacao
         )
+        tem_anotacao = bool(re.sub(r"<[^>]+>", "", item.anotacoes or "").strip())
+        badge_anotacao = (
+            ' <span class="badge" style="background:#fef3c7; color:#92400e; margin-left:6px;" title="Esta licitação possui anotações salvas">📝 Com anotação</span>'
+            if tem_anotacao
+            else ""
+        )
         pags_item = _extrair_numeros_paginas(item.paginas_referencia)
         pag_ini_item = pags_item[0] if pags_item else 1
         link_pdf_com_pag = _url_pdf_com_pagina(item.link_documento, pag_ini_item)
@@ -311,7 +359,7 @@ def painel_licitacoes(request: HttpRequest) -> HttpResponse:
             <td><strong>{html.escape(item.cidade)}</strong></td>
             <td>{html.escape(item.orgao_emissor)}</td>
             <td>{item.data_publicacao.strftime('%d/%m/%Y')}</td>
-            <td><span class="badge">{html.escape(item.modalidade)}</span></td>
+            <td><span class="badge">{html.escape(item.modalidade)}</span>{badge_anotacao}</td>
             <td>{html.escape(objeto_resumo)}</td>
             <td>{html.escape(item.paginas_referencia)}</td>
             <td onclick="event.stopPropagation();">
@@ -521,12 +569,16 @@ def detalhe_licitacao(request: HttpRequest, pk: int) -> HttpResponse:
         </button>
         """
 
+    anotacoes_iniciais_json = json.dumps(item.anotacoes or "")
+
     pagina_html = f"""<!DOCTYPE html>
 <html lang="pt-br">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Detalhes da Licitação #{item.id} — {html.escape(item.cidade)} | EPSL</title>
+    <!-- Biblioteca SunEditor (Editor Rico Estilo Microsoft Word: Fontes, Tamanhos, Alinhamento, Tabelas, Listas e Links) -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/suneditor@2.47.1/dist/css/suneditor.min.css">
     <style>
         * {{ box-sizing: border-box; }}
         body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 1080px; margin: 30px auto; padding: 0 20px; color: #1f2937; background: #f3f4f6; line-height: 1.6; }}
@@ -539,7 +591,11 @@ def detalhe_licitacao(request: HttpRequest, pk: int) -> HttpResponse:
         .objeto-box {{ background: #f8fafc; border-left: 4px solid #2563eb; padding: 20px; border-radius: 8px; font-size: 1.05rem; white-space: pre-wrap; color: #1e293b; }}
         .btn {{ display: inline-block; padding: 9px 16px; border-radius: 8px; font-weight: 600; font-size: 0.92rem; text-decoration: none; border: none; cursor: pointer; }}
         .btn-primary {{ background: #2563eb; color: #fff; }}
+        .btn-primary:hover {{ background: #1d4ed8; }}
+        .btn-success {{ background: #059669; color: #fff; }}
+        .btn-success:hover {{ background: #047857; }}
         .btn-secondary {{ background: #e5e7eb; color: #1f2937; }}
+        .btn-secondary:hover {{ background: #d1d5db; }}
         .tag-bar {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }}
         .tag-btn {{ padding: 9px 16px; border-radius: 999px; font-weight: 600; font-size: 0.9rem; cursor: pointer; border: 2px solid transparent; transition: all 0.15s; opacity: 0.78; }}
         .tag-btn:hover {{ opacity: 1; transform: translateY(-1px); }}
@@ -553,6 +609,19 @@ def detalhe_licitacao(request: HttpRequest, pk: int) -> HttpResponse:
         .page-btn {{ padding: 6px 12px; border-radius: 8px; border: 1px solid #93c5fd; background: #ffffff; color: #1e40af; font-weight: 700; font-size: 0.86rem; cursor: pointer; transition: all 0.15s; }}
         .page-btn:hover {{ background: #dbeafe; }}
         .page-btn-active {{ background: #2563eb !important; color: #ffffff !important; border-color: #1d4ed8 !important; }}
+        .sun-editor {{ border-radius: 10px !important; border-color: #cbd5e1 !important; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,0.04); }}
+        .sun-editor .se-toolbar {{ background-color: #f8fafc !important; outline: 1px solid #e2e8f0 !important; }}
+        .sun-editor-editable {{ font-family: Calibri, Arial, sans-serif; font-size: 14px; line-height: 1.6; padding: 20px !important; }}
+        .sun-editor-editable table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
+        .sun-editor-editable table td, .sun-editor-editable table th {{ border: 1px solid #94a3b8; padding: 8px 10px; }}
+        .sun-editor-editable table th {{ background: #f1f5f9; font-weight: 700; }}
+        /* Barra de fallback nativa caso o CDN esteja offline */
+        .native-word-toolbar {{ display: none; gap: 6px; flex-wrap: wrap; background: #f8fafc; border: 1px solid #cbd5e1; border-bottom: none; padding: 8px 10px; border-radius: 10px 10px 0 0; align-items: center; }}
+        .native-word-toolbar button, .native-word-toolbar select {{ padding: 5px 9px; border: 1px solid #cbd5e1; background: #fff; border-radius: 6px; cursor: pointer; font-size: 0.84rem; font-weight: 600; }}
+        .native-word-editor {{ display: none; min-height: 280px; border: 1px solid #cbd5e1; border-radius: 0 0 10px 10px; padding: 18px; background: #fff; outline: none; }}
+        .native-word-editor table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
+        .native-word-editor td, .native-word-editor th {{ border: 1px solid #94a3b8; padding: 8px; }}
+        .status-save-pill {{ display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 999px; font-size: 0.82rem; font-weight: 600; background: #f3f4f6; color: #4b5563; }}
     </style>
 </head>
 <body>
@@ -609,6 +678,61 @@ def detalhe_licitacao(request: HttpRequest, pk: int) -> HttpResponse:
         <div class="objeto-box">{html.escape(item.objeto_licitacao)}</div>
     </div>
 
+    <!-- NOVO CARD: Caderno de Anotações da Licitação (Editor Rico Estilo Word) -->
+    <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
+            <div>
+                <h2 style="margin:0;">📝 Anotações e Parecer da Licitação (Editor Estilo Word)</h2>
+                <p style="margin:2px 0 0 0; color:#6b7280; font-size:0.88rem;">
+                    Formate com tamanho de fonte, cores, alinhamento, tabelas, listas numeradas/marcadores e links clicáveis. Salva automaticamente ou com <code>Ctrl + S</code>.
+                </p>
+            </div>
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                <span id="statusSalvarAnotacao" class="status-save-pill">✓ Sincronizado</span>
+                <button type="button" class="btn btn-secondary" style="padding:7px 12px; font-size:0.84rem;" onclick="inserirModeloParecer()">📋 Inserir Modelo de Checklist/Tabela</button>
+                <button type="button" class="btn btn-success" style="padding:7px 14px; font-size:0.88rem;" onclick="salvarAnotacoesAgora(true)">💾 Salvar Anotações</button>
+            </div>
+        </div>
+
+        <!-- Barra de ferramentas nativa de contingência (exibida apenas se o CDN do SunEditor estiver bloqueado/offline) -->
+        <div id="nativeToolbar" class="native-word-toolbar">
+            <select onchange="execCmdNativo('fontName', this.value)" title="Fonte">
+                <option value="Calibri">Calibri</option>
+                <option value="Arial">Arial</option>
+                <option value="Times New Roman">Times New Roman</option>
+                <option value="Verdana">Verdana</option>
+                <option value="Courier New">Courier New</option>
+            </select>
+            <select onchange="aplicarTamanhoFonteNativo(this.value)" title="Tamanho da Fonte">
+                <option value="12px">10 pt</option>
+                <option value="14px" selected>12 pt</option>
+                <option value="16px">14 pt</option>
+                <option value="18px">16 pt</option>
+                <option value="22px">18 pt</option>
+                <option value="28px">24 pt</option>
+                <option value="36px">32 pt</option>
+            </select>
+            <button type="button" onclick="execCmdNativo('bold')" title="Negrito"><b>B</b></button>
+            <button type="button" onclick="execCmdNativo('italic')" title="Itálico"><i>I</i></button>
+            <button type="button" onclick="execCmdNativo('underline')" title="Sublinhado"><u>U</u></button>
+            <button type="button" onclick="execCmdNativo('strikeThrough')" title="Tachado"><s>S</s></button>
+            <input type="color" onchange="execCmdNativo('foreColor', this.value)" title="Cor do Texto" style="width:30px; height:28px; padding:1px; border:1px solid #cbd5e1; border-radius:4px; cursor:pointer;">
+            <button type="button" onclick="execCmdNativo('justifyLeft')" title="Alinhar à Esquerda">⬅ Esquerda</button>
+            <button type="button" onclick="execCmdNativo('justifyCenter')" title="Centralizar">↔ Centro</button>
+            <button type="button" onclick="execCmdNativo('justifyRight')" title="Alinhar à Direita">➡ Direita</button>
+            <button type="button" onclick="execCmdNativo('justifyFull')" title="Justificar">☰ Justificar</button>
+            <button type="button" onclick="execCmdNativo('insertOrderedList')" title="Enumeração (1. 2. 3.)">1. Lista</button>
+            <button type="button" onclick="execCmdNativo('insertUnorderedList')" title="Marcadores (•)">• Lista</button>
+            <button type="button" onclick="inserirTabelaNativa()" title="Inserir Tabela">📊 Tabela</button>
+            <button type="button" onclick="inserirLinkNativo()" title="Inserir Link">🔗 Link</button>
+            <button type="button" onclick="execCmdNativo('removeFormat')" title="Limpar Formatação">🧹 Limpar</button>
+        </div>
+        <div id="nativeEditor" class="native-word-editor" contenteditable="true"></div>
+
+        <!-- Textarea base para o SunEditor -->
+        <textarea id="editorAnotacoesWord" style="width:100%; height:340px;"></textarea>
+    </div>
+
     <div class="card">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:10px;">
             <h3 style="margin:0;">📖 Visualização do Diário Oficial — Aberto na Página <span id="lblPaginaAtual">{pagina_inicial}</span> (Ref: {html.escape(item.paginas_referencia)})</h3>
@@ -632,9 +756,17 @@ def detalhe_licitacao(request: HttpRequest, pk: int) -> HttpResponse:
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/suneditor@2.47.1/dist/suneditor.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/suneditor@2.47.1/src/lang/pt_br.js"></script>
     <script>
         const csrfToken = "{csrf_token}";
         const urlBasePdf = {json.dumps(url_base_sem_hash)};
+        const anotacoesIniciais = {anotacoes_iniciais_json};
+        let instanciaSunEditor = null;
+        let modoFallbackNativo = false;
+        let timerAutoSave = null;
+        let ultimoConteudoSalvo = anotacoesIniciais;
+
         const metaPorTag = {{
             "": {{ label: "Sem Marcação", icon: "⚪", cls: "tag-none" }},
             "favorito": {{ label: "Favorito", icon: "⭐", cls: "tag-favorito" }},
@@ -642,6 +774,210 @@ def detalhe_licitacao(request: HttpRequest, pk: int) -> HttpResponse:
             "sem_conformidade": {{ label: "Sem Conformidade", icon: "⚠️", cls: "tag-inconformidade" }},
             "ignorado": {{ label: "Ignorado", icon: "🚫", cls: "tag-ignorado" }}
         }};
+
+        // Inicializa o SunEditor (estilo Microsoft Word) com fallback automático para editor nativo
+        function inicializarEditorWord() {{
+            if (typeof SUNEDITOR !== "undefined") {{
+                instanciaSunEditor = SUNEDITOR.create("editorAnotacoesWord", {{
+                    lang: (typeof SUNEDITOR_LANG !== "undefined" && SUNEDITOR_LANG.pt_br) ? SUNEDITOR_LANG.pt_br : undefined,
+                    width: "100%",
+                    minHeight: "320px",
+                    height: "auto",
+                    placeholder: "Digite aqui suas anotações, cálculos de preços, itens de edital, links ou tabelas sobre esta licitação...",
+                    font: [
+                        "Calibri",
+                        "Arial",
+                        "Times New Roman",
+                        "Tahoma",
+                        "Verdana",
+                        "Georgia",
+                        "Courier New"
+                    ],
+                    fontSize: [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 28, 32, 36, 48, 72],
+                    fontSizeUnit: "pt",
+                    defaultStyle: "font-family: Calibri, Arial, sans-serif; font-size: 11pt; line-height: 1.6;",
+                    buttonList: [
+                        ["undo", "redo"],
+                        ["font", "fontSize", "formatBlock"],
+                        ["bold", "underline", "italic", "strike", "subscript", "superscript"],
+                        ["fontColor", "hiliteColor", "textStyle"],
+                        ["removeFormat"],
+                        ["outdent", "indent"],
+                        ["align", "horizontalRule", "list", "lineHeight"],
+                        ["table", "link"],
+                        ["fullScreen", "showBlocks", "codeView", "print"]
+                    ],
+                    value: anotacoesIniciais
+                }});
+
+                instanciaSunEditor.onChange = function(contents) {{
+                    agendarAutoSave();
+                }};
+            }} else {{
+                // Fallback nativo caso não haja conexão com o CDN jsDelivr
+                modoFallbackNativo = true;
+                document.getElementById("editorAnotacoesWord").style.display = "none";
+                document.getElementById("nativeToolbar").style.display = "flex";
+                const ed = document.getElementById("nativeEditor");
+                ed.style.display = "block";
+                ed.innerHTML = anotacoesIniciais;
+                ed.addEventListener("input", () => agendarAutoSave());
+            }}
+        }}
+
+        function obterHtmlAnotacoes() {{
+            if (instanciaSunEditor) {{
+                return instanciaSunEditor.getContents(true);
+            }}
+            if (modoFallbackNativo) {{
+                return document.getElementById("nativeEditor").innerHTML;
+            }}
+            return document.getElementById("editorAnotacoesWord").value;
+        }}
+
+        function definirHtmlAnotacoes(novoHtml) {{
+            if (instanciaSunEditor) {{
+                instanciaSunEditor.setContents(novoHtml);
+            }} else if (modoFallbackNativo) {{
+                document.getElementById("nativeEditor").innerHTML = novoHtml;
+            }}
+            agendarAutoSave();
+        }}
+
+        function atualizarBadgeSalvar(texto, bg, cor) {{
+            const el = document.getElementById("statusSalvarAnotacao");
+            if (!el) return;
+            el.textContent = texto;
+            el.style.background = bg;
+            el.style.color = cor;
+        }}
+
+        function agendarAutoSave() {{
+            atualizarBadgeSalvar("● Alterações pendentes...", "#fef3c7", "#92400e");
+            if (timerAutoSave) clearTimeout(timerAutoSave);
+            timerAutoSave = setTimeout(() => salvarAnotacoesAgora(false), 1500);
+        }}
+
+        async function salvarAnotacoesAgora(forcar) {{
+            if (timerAutoSave) {{
+                clearTimeout(timerAutoSave);
+                timerAutoSave = null;
+            }}
+            const conteudoAtual = obterHtmlAnotacoes();
+            if (!forcar && conteudoAtual === ultimoConteudoSalvo) {{
+                atualizarBadgeSalvar("✓ Sincronizado", "#d1fae5", "#065f46");
+                return;
+            }}
+
+            atualizarBadgeSalvar("⏳ Salvando...", "#dbeafe", "#1e40af");
+            try {{
+                const resp = await fetch("/licitacoes/{item.id}/anotacoes/", {{
+                    method: "POST",
+                    headers: {{
+                        "Content-Type": "application/json",
+                        "X-CSRFToken": csrfToken,
+                        "X-Requested-With": "XMLHttpRequest"
+                    }},
+                    body: JSON.stringify({{ anotacoes: conteudoAtual }})
+                }});
+                const dados = await resp.json();
+                if (resp.ok && dados.status === "sucesso") {{
+                    ultimoConteudoSalvo = conteudoAtual;
+                    atualizarBadgeSalvar(`✓ Salvo às ${{dados.horario}}`, "#d1fae5", "#065f46");
+                }} else {{
+                    atualizarBadgeSalvar("⚠️ Erro ao salvar", "#fee2e2", "#991b1b");
+                }}
+            }} catch (e) {{
+                atualizarBadgeSalvar("⚠️ Falha de conexão ao salvar", "#fee2e2", "#991b1b");
+            }}
+        }}
+
+        function inserirModeloParecer() {{
+            const modeloHtml = `
+                <h3 style="color:#1e40af; margin-bottom:6px;">📋 Resumo de Análise Técnica e Comercial</h3>
+                <p><strong>Responsável pela análise:</strong> {html.escape(request.user.get_username())} &nbsp;|&nbsp; <strong>Data:</strong> ${{new Date().toLocaleDateString('pt-BR')}}</p>
+                <table style="width:100%; border-collapse:collapse; margin:12px 0;">
+                    <thead>
+                        <tr style="background:#f1f5f9;">
+                            <th style="border:1px solid #94a3b8; padding:8px;">Item / Lote</th>
+                            <th style="border:1px solid #94a3b8; padding:8px;">Especificação Solicitada</th>
+                            <th style="border:1px solid #94a3b8; padding:8px;">Qtd.</th>
+                            <th style="border:1px solid #94a3b8; padding:8px;">Valor Estimado (R$)</th>
+                            <th style="border:1px solid #94a3b8; padding:8px;">Atende?</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td style="border:1px solid #94a3b8; padding:8px; text-align:center;">01</td>
+                            <td style="border:1px solid #94a3b8; padding:8px;">Descreva o equipamento / software / serviço...</td>
+                            <td style="border:1px solid #94a3b8; padding:8px; text-align:center;">1</td>
+                            <td style="border:1px solid #94a3b8; padding:8px; text-align:right;">R$ 0,00</td>
+                            <td style="border:1px solid #94a3b8; padding:8px; text-align:center;">✅ Sim</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <p><strong>Pontos de Atenção / Exigências do Edital:</strong></p>
+                <ol>
+                    <li>Prazo de entrega e local de execução: </li>
+                    <li>Atestado de capacidade técnica exigido: </li>
+                    <li>Portal de compras / Link externo: <a href="https://www.gov.br/compras" target="_blank" rel="noopener">Portal de Compras</a></li>
+                </ol>
+            `;
+            const atual = obterHtmlAnotacoes();
+            definirHtmlAnotacoes(atual ? (atual + "<hr>" + modeloHtml) : modeloHtml);
+            salvarAnotacoesAgora(true);
+        }}
+
+        // Funções de apoio para a barra nativa caso o CDN esteja offline
+        function execCmdNativo(cmd, val = null) {{
+            document.getElementById("nativeEditor").focus();
+            document.execCommand(cmd, false, val);
+            agendarAutoSave();
+        }}
+
+        function aplicarTamanhoFonteNativo(pxVal) {{
+            document.getElementById("nativeEditor").focus();
+            const sel = window.getSelection();
+            if (!sel || sel.rangeCount === 0) return;
+            const span = document.createElement("span");
+            span.style.fontSize = pxVal;
+            span.textContent = sel.toString() || "Texto";
+            const range = sel.getRangeAt(0);
+            range.deleteContents();
+            range.insertNode(span);
+            agendarAutoSave();
+        }}
+
+        function inserirTabelaNativa() {{
+            const linhas = parseInt(prompt("Quantas linhas na tabela?", "3") || "0", 10);
+            const cols = parseInt(prompt("Quantas colunas na tabela?", "3") || "0", 10);
+            if (linhas <= 0 || cols <= 0) return;
+            let htmlTab = '<table style="width:100%; border-collapse:collapse; margin:10px 0;"><tbody>';
+            for (let r = 0; r < linhas; r++) {{
+                htmlTab += "<tr>";
+                for (let c = 0; c < cols; c++) {{
+                    htmlTab += `<td style="border:1px solid #94a3b8; padding:8px;">${{r === 0 ? "<strong>Cabeçalho</strong>" : "Célula"}}</td>`;
+                }}
+                htmlTab += "</tr>";
+            }}
+            htmlTab += "</tbody></table><p><br></p>";
+            execCmdNativo("insertHTML", htmlTab);
+        }}
+
+        function inserirLinkNativo() {{
+            const url = prompt("Digite a URL do link (ex: https://...):", "https://");
+            if (!url) return;
+            const texto = prompt("Texto de exibição do link:", url) || url;
+            execCmdNativo("insertHTML", `<a href="${{url}}" target="_blank" rel="noopener">${{texto}}</a>`);
+        }}
+
+        // Atalho de teclado Ctrl+S / Cmd+S para salvar anotações como no Word
+        document.addEventListener("keydown", (ev) => {{
+            if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") {{
+                ev.preventDefault();
+                salvarAnotacoesAgora(true);
+            }}
+        }});
 
         function irParaPaginaPdf(numPagina) {{
             const pag = Math.max(1, parseInt(numPagina, 10) || 1);
@@ -698,10 +1034,40 @@ def detalhe_licitacao(request: HttpRequest, pk: int) -> HttpResponse:
                 setTimeout(() => {{ msg.style.display = "none"; }}, 2500);
             }}
         }}
+
+        inicializarEditorWord();
     </script>
 </body>
 </html>"""
     return HttpResponse(pagina_html)
+
+
+@login_required
+@require_POST
+def salvar_anotacoes_licitacao(request: HttpRequest, pk: int) -> JsonResponse:
+    """
+    Salva as anotações formatadas em HTML (`anotacoes`) de uma licitação específica
+    (`POST /licitacoes/<int:pk>/anotacoes/`), sanitizando scripts/eventos inseguros.
+    """
+    import datetime
+
+    item = get_object_or_404(Licitacao, pk=pk)
+    try:
+        payload = json.loads(request.body.decode("utf-8"))
+        bruto = str(payload.get("anotacoes", ""))
+    except Exception:
+        bruto = request.POST.get("anotacoes", "")
+
+    html_seguro = _sanitizar_html_anotacoes(bruto)
+    item.anotacoes = html_seguro
+    item.save(update_fields=["anotacoes"])
+    return JsonResponse(
+        {
+            "status": "sucesso",
+            "id": item.id,
+            "horario": datetime.datetime.now().strftime("%H:%M:%S"),
+        }
+    )
 
 
 @login_required

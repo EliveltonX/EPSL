@@ -15,7 +15,7 @@ class LicitacaoAdmin(admin.ModelAdmin):
     list_display_links = ("cidade", "orgao_emissor")
     list_editable = ("tag_analise",)
     list_filter = ("tag_analise", "cidade", "modalidade", "data_publicacao")
-    search_fields = ("cidade", "orgao_emissor", "objeto_licitacao")
+    search_fields = ("cidade", "orgao_emissor", "objeto_licitacao", "anotacoes")
     date_hierarchy = "data_publicacao"
 
 

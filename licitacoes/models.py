@@ -61,6 +61,12 @@ class Licitacao(models.Model):
         verbose_name="Tag de Análise",
         help_text="Marcação de situação pós-análise (Favorito, Em Análise, Sem Conformidade, Ignorado).",
     )
+    anotacoes = models.TextField(
+        blank=True,
+        default="",
+        verbose_name="Anotações da Licitação",
+        help_text="Anotações formatadas em HTML (fontes, alinhamento, tabelas, listas e links) sobre esta licitação.",
+    )
 
     class Meta:
         db_table = "licitacoes"

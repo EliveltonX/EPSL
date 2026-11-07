@@ -11,6 +11,7 @@ from licitacoes.views import (
     painel_licitacoes,
     painel_servidor,
     receber_stream_pdf_local,
+    salvar_anotacoes_licitacao,
     status_processamento_json,
 )
 
@@ -25,6 +26,11 @@ urlpatterns = [
     ),
     path("<int:pk>/", detalhe_licitacao, name="detalhe_licitacao"),
     path("<int:pk>/tag/", atualizar_tag_licitacao, name="atualizar_tag_licitacao"),
+    path(
+        "<int:pk>/anotacoes/",
+        salvar_anotacoes_licitacao,
+        name="salvar_anotacoes_licitacao",
+    ),
     path("upload/", pagina_upload_diarios, name="pagina_upload_diarios"),
     path("upload/presign/", gerar_urls_upload_presign, name="gerar_urls_upload_presign"),
     path(
