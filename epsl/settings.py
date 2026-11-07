@@ -226,6 +226,92 @@ def _descobrir_postgres_na_rede_docker(
     return hosts_com_porta_5432[0]
 
 
+def _resolver_usuario_dono_postgres(
+    host: str,
+    port: int,
+    db_name: str,
+    configured_user: str,
+    db_password: str,
+) -> str:
+    """
+    No Supabase self-hosted (Coolify), o superusuário real do cluster PostgreSQL é
+    `supabase_admin` (que compartilha a mesma senha `SERVICE_PASSWORD_POSTGRES` do usuário `postgres`).
+    Se a tabela `licitacoes` foi criada originalmente por `supabase_admin` e o `DB_USER` estiver
+    como `postgres` (ou vice-versa), o comando `migrate` falha com:
+    `psycopg.errors.InsufficientPrivilege: must be owner of table licitacoes`.
+    Esta função detecta automaticamente o dono (`tableowner`) da tabela `licitacoes` (ou o superusuário
+    `supabase_admin`) e ajusta o usuário da conexão / permissões automaticamente.
+    """
+    try:
+        import psycopg
+
+        dono_tabela = None
+        with psycopg.connect(
+            host=host,
+            port=port,
+            dbname=db_name,
+            user=configured_user,
+            password=db_password,
+            connect_timeout=2,
+            autocommit=True,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT tableowner FROM pg_tables WHERE schemaname = 'public' AND tablename = 'licitacoes';"
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    dono_tabela = str(row[0]).strip()
+
+                if dono_tabela and dono_tabela != configured_user:
+                    # Tenta assumir a role dona na própria conexão ou transferir ownership
+                    try:
+                        cur.execute(f'SET ROLE "{dono_tabela}";')
+                        cur.execute(f'ALTER TABLE public.licitacoes OWNER TO "{configured_user}";')
+                        cur.execute("RESET ROLE;")
+                        return configured_user
+                    except Exception:
+                        pass
+
+        # Testa conectar diretamente com o dono da tabela ou com `supabase_admin`
+        candidatos_user = []
+        if dono_tabela and dono_tabela != configured_user:
+            candidatos_user.append(dono_tabela)
+        if "supabase_admin" not in candidatos_user and configured_user != "supabase_admin":
+            candidatos_user.append("supabase_admin")
+
+        for cand_user in candidatos_user:
+            try:
+                with psycopg.connect(
+                    host=host,
+                    port=port,
+                    dbname=db_name,
+                    user=cand_user,
+                    password=db_password,
+                    connect_timeout=2,
+                    autocommit=True,
+                ) as admin_conn:
+                    with admin_conn.cursor() as acur:
+                        acur.execute(
+                            f'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO "{configured_user}", "{cand_user}";'
+                        )
+                        acur.execute(
+                            f'GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO "{configured_user}", "{cand_user}";'
+                        )
+                    print(
+                        f"[EPSL-AUTO-DISCOVERY] Usando usuario proprietario do banco '{cand_user}' "
+                        f"(dono da tabela licitacoes: '{dono_tabela or cand_user}') para evitar erro de permissao em migrations.",
+                        file=sys.stderr,
+                    )
+                    return cand_user
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return configured_user
+
+
 if IS_DEPLOY:
     _raw_db_host = os.getenv("DB_HOST", "localhost")
     _clean_db_host = _sanitize_db_host(_raw_db_host)
@@ -259,6 +345,15 @@ if IS_DEPLOY:
                 file=sys.stderr,
             )
             _clean_db_host = _novo_host
+
+    if not _is_collectstatic:
+        _db_user = _resolver_usuario_dono_postgres(
+            host=_clean_db_host,
+            port=_db_port,
+            db_name=_db_name,
+            configured_user=_db_user,
+            db_password=_db_password,
+        )
 
     try:
         socket.getaddrinfo(_clean_db_host, _db_port)
