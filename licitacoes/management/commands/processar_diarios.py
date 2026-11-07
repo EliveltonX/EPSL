@@ -1,15 +1,19 @@
 """
 Management Command: processar_diarios
 
-Suporta automaticamente dois modos de operação (definidos por `APP_ENV` no settings.py):
-1. Modo TESTE (`APP_ENV=test` / `USE_LOCAL_STORAGE=True`):
-   - Lê arquivos PDF da pasta local `storage_local/novos_diarios/`.
-   - Move os arquivos processados para `storage_local/diarios_processados/{YYYY}/{MM}/{arquivo.pdf}`.
-   - Salva os dados estruturados no banco MySQL local.
-2. Modo DEPLOY (`APP_ENV=deploy` / `USE_LOCAL_STORAGE=False`):
-   - Lê arquivos PDF do Supabase Storage (`novos_diarios/`) via `boto3`.
-   - Move os arquivos processados para `diarios_processados/{YYYY}/{MM}/{arquivo.pdf}` no bucket.
-   - Salva os dados estruturados no banco PostgreSQL do Supabase.
+Estratégia Ultra-Econômica de RPD / RPM (Super-Batching 250K TPM + Triagem Local):
+1. Fase 1 — Triagem Local 100% Gratuita (Zero IA):
+   - Verifica deduplicação dupla (`SHA-256` binário + `SHA-256` do texto extraído via PyMuPDF).
+   - Aplica filtro local PyMuPDF + Regex página a página.
+   - PDFs duplicados ou sem nenhuma página com palavras-chave do nicho são arquivados/removidos
+     imediatamente consumindo **0 requisições ao Google Gemini (0 RPM / 0 RPD)**.
+2. Fase 2 — Empacotamento em Super-Batch na Janela de Contexto (250.000 TPM):
+   - Agrupa as páginas promissoras de múltiplos PDFs (até `GEMINI_SUPERBATCH_MAX_FILES` arquivos
+     ou `GEMINI_SUPERBATCH_MAX_CHARS` ≈ 450.000 caracteres / ~112.000 tokens) em **uma única chamada**
+     estruturada ao Google Gemini, reduzindo o consumo de RPD e RPM em até 80–90%.
+   - Aplica espaçamento mínimo obrigatório (`GEMINI_MIN_INTERVAL_BETWEEN_CALLS_SEC`, padrão 20s)
+     entre chamadas consecutivas e balanceia a carga entre `gemini-3.5-flash-lite` (500 RPD) e
+     `gemini-3.1-flash-lite` (500 RPD), seguidos pelos modelos de reserva.
 """
 
 from __future__ import annotations
@@ -20,8 +24,9 @@ import re
 import shutil
 import time
 import unicodedata
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 from urllib.parse import quote
 
 import boto3
@@ -51,6 +56,7 @@ from licitacoes.pipeline_progress import (
     iniciar_progresso,
     ordenar_modelos_para_chamada,
     registrar_cooldown_modelo,
+    registrar_erro_arquivo,
     registrar_uso_modelo,
 )
 from licitacoes.storage_upload import s3_credenciais_validas
@@ -93,9 +99,16 @@ def normalizar_texto_para_regex(texto: str) -> str:
 
 
 # ==============================================================================
-# 2. Schema Pydantic para Extração Estruturada no Google Gemini
+# 2. Schema Pydantic para Extração Estruturada no Google Gemini (Suporte a Super-Batch)
 # ==============================================================================
 class LicitacaoExtraidaSchema(BaseModel):
+    documento_id: str = Field(
+        default="DOC_1",
+        description=(
+            "Identificador exato do documento de onde esta licitação foi extraída "
+            "(ex: 'DOC_1', 'DOC_2'), conforme o cabeçalho 'INÍCIO DO DOCUMENTO [DOC_X]'."
+        ),
+    )
     cidade: str = Field(
         description="Nome da cidade/município do órgão licitante (ex: 'São Paulo - SP' ou 'Curitiba')."
     )
@@ -119,8 +132,24 @@ class LicitacaoExtraidaSchema(BaseModel):
 class ResultadoExtracaoDiarioSchema(BaseModel):
     licitacoes: List[LicitacaoExtraidaSchema] = Field(
         default_factory=list,
-        description="Lista de licitações do nicho de Tecnologia/Computação/Educação encontradas nas páginas enviadas.",
+        description="Lista de licitações do nicho de Tecnologia/Computação/Educação encontradas nos documentos enviados.",
     )
+
+
+@dataclass
+class CandidatoGemini:
+    """Representa um PDF já filtrado localmente pelo PyMuPDF + Regex e pronto para entrar num Super-Batch."""
+
+    indice_arquivo: int
+    doc_id: str
+    object_key: str
+    nome_arquivo: str
+    tamanho_bytes: int
+    sha256_arquivo: str
+    sha256_texto: str
+    total_paginas: int
+    paginas_promissoras: List[tuple[int, str, List[str]]] = field(default_factory=list)
+    bloco_texto: str = ""
 
 
 # ==============================================================================
@@ -129,8 +158,8 @@ class ResultadoExtracaoDiarioSchema(BaseModel):
 class Command(BaseCommand):
     help = (
         "Varre a pasta 'novos_diarios/' (em pasta local no modo teste ou Supabase Storage no modo deploy), "
-        "filtra páginas com PyMuPDF + Regex, extrai dados estruturados com Google Gemini, "
-        "salva no banco de dados e move o PDF para 'diarios_processados/'."
+        "filtra páginas com PyMuPDF + Regex, agrupa múltiplos PDFs em Super-Batches aproveitando a janela "
+        "de 250K TPM do Google Gemini para minimizar RPD/RPM, salva no banco e move para 'diarios_processados/'."
     )
 
     def add_arguments(self, parser: CommandParser) -> None:
@@ -143,7 +172,16 @@ class Command(BaseCommand):
             "--max-files",
             type=int,
             default=0,
-            help="Limita a quantidade máxima de arquivos PDF processados nesta execução (0 = todos).",
+            help=(
+                "Limita a quantidade máxima de arquivos PDF enviados à IA nesta execução "
+                "(0 = todos; o agendador de 10 min usa PIPELINE_MAX_GEMINI_FILES_PER_CRON)."
+            ),
+        )
+        parser.add_argument(
+            "--origem",
+            type=str,
+            default="Manual / Web",
+            help="Identifica quem disparou a execução (ex: 'Manual / Web' ou 'Agendador Automático (10 min)').",
         )
 
     def _log(self, msg: str, style_func=None, is_erro: bool = False) -> None:
@@ -157,9 +195,10 @@ class Command(BaseCommand):
     def handle(self, *args, **options) -> None:
         dry_run: bool = options["dry_run"]
         max_files: int = options["max_files"]
+        origem: str = options.get("origem") or "Manual / Web"
         use_local: bool = settings.USE_LOCAL_STORAGE
 
-        iniciar_progresso(total_arquivos=0)
+        iniciar_progresso(total_arquivos=0, origem=origem)
 
         bucket_name: str = settings.SUPABASE_STORAGE_BUCKET
         input_prefix: str = settings.SUPABASE_INPUT_PREFIX
@@ -171,7 +210,7 @@ class Command(BaseCommand):
             else f"DEPLOY PRODUÇÃO (PostgreSQL Supabase + Bucket '{bucket_name}')"
         )
         self._log(
-            f"Iniciando processamento de Diários Oficiais | Modo: {modo_str}",
+            f"Iniciando processamento ({origem}) | Modo: {modo_str}",
             style_func=self.style.NOTICE,
         )
 
@@ -197,18 +236,44 @@ class Command(BaseCommand):
                 finalizar_progresso("Concluído (nenhum arquivo pendente na fila).")
                 return
 
-            if max_files > 0:
-                pdf_keys = pdf_keys[:max_files]
+            # Seleciona os arquivos para este ciclo
+            total_fila = len(pdf_keys)
+            definir_total_arquivos(
+                min(total_fila, max_files) if max_files > 0 else total_fila
+            )
+            self._log(
+                f"Fila 'novos_diarios/': {total_fila} PDF(s) aguardando análise."
+            )
 
-            definir_total_arquivos(len(pdf_keys))
-            self._log(f"Encontrados {len(pdf_keys)} arquivo(s) PDF para processar.")
+            sincronizar_hashes_locais_existentes()
 
-            for idx, object_key in enumerate(pdf_keys, start=1):
+            # ==================================================================
+            # FASE 1: Triagem Local Gratuita (SHA-256 + PyMuPDF + Regex)
+            # ==================================================================
+            candidatos_gemini: List[CandidatoGemini] = []
+            arquivos_avaliados = 0
+
+            for object_key in pdf_keys:
+                if max_files > 0 and len(candidatos_gemini) >= max_files:
+                    restantes = total_fila - arquivos_avaliados
+                    self._log(
+                        f"\n[Modo Econômico] Limite de {max_files} PDF(s) para IA por ciclo atingido. "
+                        f"Os outros {restantes} PDF(s) permanecem na fila para o próximo ciclo de 10 min.",
+                        style_func=self.style.NOTICE,
+                    )
+                    break
+
+                arquivos_avaliados += 1
                 nome_curto = Path(object_key).name
-                atualizar_etapa_arquivo(idx, nome_curto, "Baixando e lendo PDF...")
+                atualizar_etapa_arquivo(
+                    arquivos_avaliados,
+                    nome_curto,
+                    "Fase 1 (Local): Baixando e filtrando com PyMuPDF + Regex...",
+                )
                 try:
-                    self._processar_arquivo_pdf(
-                        indice_arquivo=idx,
+                    cand = self._triar_arquivo_localmente(
+                        indice_arquivo=arquivos_avaliados,
+                        doc_seq=len(candidatos_gemini) + 1,
                         use_local=use_local,
                         s3_client=s3_client,
                         bucket_name=bucket_name,
@@ -216,14 +281,84 @@ class Command(BaseCommand):
                         processed_prefix=processed_prefix,
                         dry_run=dry_run,
                     )
+                    if cand is not None:
+                        candidatos_gemini.append(cand)
                 except Exception as exc:
-                    logger.exception("Erro ao processar o arquivo %s: %s", object_key, exc)
+                    logger.exception(
+                        "Erro na triagem local do arquivo %s: %s", object_key, exc
+                    )
                     self._log(
-                        f"[ERRO] Falha ao processar '{object_key}': {exc}",
+                        f"[ERRO] Falha ao ler/filtrar '{object_key}': {exc}",
                         style_func=self.style.ERROR,
                         is_erro=True,
                     )
-                    concluir_um_arquivo(teve_erro=True)
+                    registrar_erro_arquivo(nome_curto, object_key, str(exc))
+                    concluir_um_arquivo(nome_arquivo=nome_curto, teve_erro=True)
+
+            # Ajusta o total efetivo da barra de progresso para os arquivos avaliados neste ciclo
+            definir_total_arquivos(max(arquivos_avaliados, 1))
+
+            if not candidatos_gemini or dry_run:
+                finalizar_progresso(
+                    "Concluído sem necessidade de chamadas à IA (0 requisições Gemini utilizadas)!"
+                )
+                return
+
+            # ==================================================================
+            # FASE 2: Empacotamento em Super-Batches (Janela 250K TPM) + Gemini
+            # ==================================================================
+            superbatches = self._agrupar_em_superbatches(candidatos_gemini)
+            economia = len(candidatos_gemini) - len(superbatches)
+            self._log(
+                f"\n[Estratégia Super-Batch 250K TPM] {len(candidatos_gemini)} PDF(s) com indícios "
+                f"foram agrupados em apenas {len(superbatches)} chamada(s) ao Google Gemini "
+                f"(economia direta de {economia} requisição(ões) RPD/RPM)!",
+                style_func=self.style.SUCCESS,
+            )
+
+            for idx_lote, lote in enumerate(superbatches, start=1):
+                nomes_lote = ", ".join(c.nome_arquivo for c in lote)
+                chars_lote = sum(len(c.bloco_texto) for c in lote)
+                tokens_estimados = max(1, chars_lote // 4)
+                self._log(
+                    f"\n-> [Super-Batch {idx_lote}/{len(superbatches)}] Enviando {len(lote)} PDF(s) "
+                    f"em uma única requisição (~{tokens_estimados:,} tokens / 250.000 TPM): [{nomes_lote}]"
+                )
+                try:
+                    mapa_licitacoes = self._extrair_superbatch_com_gemini(
+                        idx_lote=idx_lote,
+                        total_lotes=len(superbatches),
+                        lote=lote,
+                    )
+                    for cand in lote:
+                        lics_do_pdf = mapa_licitacoes.get(cand.doc_id, [])
+                        self._finalizar_e_arquivar_candidato(
+                            cand=cand,
+                            licitacoes_extraidas=lics_do_pdf,
+                            use_local=use_local,
+                            s3_client=s3_client,
+                            bucket_name=bucket_name,
+                            processed_prefix=processed_prefix,
+                        )
+                except Exception as exc:
+                    logger.exception(
+                        "Erro ao processar Super-Batch %s (%s): %s",
+                        idx_lote,
+                        nomes_lote,
+                        exc,
+                    )
+                    self._log(
+                        f"[ERRO] Falha no Super-Batch [{nomes_lote}]: {exc}",
+                        style_func=self.style.ERROR,
+                        is_erro=True,
+                    )
+                    for cand in lote:
+                        registrar_erro_arquivo(
+                            cand.nome_arquivo, cand.object_key, str(exc)
+                        )
+                        concluir_um_arquivo(
+                            nome_arquivo=cand.nome_arquivo, teve_erro=True
+                        )
                     if "API_KEY_INVALID" in str(exc) or "COLE_AQUI_SUA_CHAVE" in str(exc):
                         self._log(
                             "[PARADA DE SEGURANÇA] Processamento interrompido pois a GEMINI_API_KEY é inválida no servidor.",
@@ -241,11 +376,9 @@ class Command(BaseCommand):
     # --------------------------------------------------------------------------
     # Métodos Auxiliares: Armazenamento Local em Pasta (Modo Teste)
     # --------------------------------------------------------------------------
-    def _listar_pdfs_locais(self, input_prefix: str, processed_prefix: str) -> List[str]:
-        """
-        Garante que as pastas locais `novos_diarios/` e `diarios_processados/` existam
-        dentro de `LOCAL_STORAGE_ROOT` e retorna a lista de caminhos dos PDFs pendentes.
-        """
+    def _listar_pdfs_locais(
+        self, input_prefix: str, processed_prefix: str
+    ) -> List[str]:
         root_dir: Path = Path(settings.LOCAL_STORAGE_ROOT)
         input_dir = root_dir / input_prefix.strip("/")
         processed_dir = root_dir / processed_prefix.strip("/")
@@ -261,10 +394,6 @@ class Command(BaseCommand):
         return arquivos
 
     def _gerar_nome_unico_local(self, dest_dir: Path, filename: str) -> str:
-        """
-        Se já existir um arquivo com o mesmo nome na pasta de destino local,
-        adiciona um sufixo incremental (_2, _3, ...) antes da extensão .pdf.
-        """
         candidato = dest_dir / filename
         if not candidato.exists():
             return filename
@@ -284,11 +413,6 @@ class Command(BaseCommand):
         processed_prefix: str,
         data_ref: datetime.date,
     ) -> str:
-        """
-        Move o PDF da pasta local `storage_local/novos_diarios/{arquivo.pdf}` para
-        `storage_local/diarios_processados/{YYYY}/{MM}/{arquivo.pdf}` (renomeando
-        automaticamente caso já exista arquivo com o mesmo nome) e retorna a URL local.
-        """
         source_path = Path(source_path_str)
         prefix_limpo = processed_prefix.strip("/")
         ano = f"{data_ref.year:04d}"
@@ -303,14 +427,17 @@ class Command(BaseCommand):
 
         relative_url_path = f"{prefix_limpo}/{ano}/{mes}/{filename}"
         encoded_path = quote(relative_url_path, safe="/")
-        base_media = "/media" if settings.IS_DEPLOY else settings.LOCAL_MEDIA_BASE_URL.rstrip("/")
+        base_media = (
+            "/media"
+            if settings.IS_DEPLOY
+            else settings.LOCAL_MEDIA_BASE_URL.rstrip("/")
+        )
         return f"{base_media}/{encoded_path}"
 
     # --------------------------------------------------------------------------
     # Métodos Auxiliares: Supabase Storage via S3 / boto3 (Modo Deploy)
     # --------------------------------------------------------------------------
     def _get_s3_client(self) -> BaseClient:
-        """Inicializa o cliente boto3 apontando para o endpoint S3 do Supabase Storage."""
         return boto3.client(
             "s3",
             endpoint_url=settings.SUPABASE_S3_ENDPOINT_URL,
@@ -322,7 +449,6 @@ class Command(BaseCommand):
     def _listar_pdfs_s3(
         self, s3_client: BaseClient, bucket_name: str, input_prefix: str
     ) -> List[str]:
-        """Lista todas as chaves .pdf dentro de `novos_diarios/` no Supabase Storage."""
         paginator = s3_client.get_paginator("list_objects_v2")
         pdf_keys: List[str] = []
 
@@ -332,12 +458,11 @@ class Command(BaseCommand):
                 if key.lower().endswith(".pdf") and key != input_prefix:
                     pdf_keys.append(key)
 
-        return pdf_keys
+        return sorted(pdf_keys)
 
     def _s3_objeto_existe(
         self, s3_client: BaseClient, bucket_name: str, key: str
     ) -> bool:
-        """Verifica se uma chave (Key) já existe no bucket S3/Supabase Storage."""
         try:
             s3_client.head_object(Bucket=bucket_name, Key=key)
             return True
@@ -351,11 +476,6 @@ class Command(BaseCommand):
         base_prefix: str,
         filename: str,
     ) -> str:
-        """
-        O protocolo S3 / Supabase Storage NÃO renomeia arquivos automaticamente (ele sobrescreve
-        no PutObject/CopyObject ou retorna erro 409). Esta função verifica se a chave já existe
-        em `diarios_processados/{YYYY}/{MM}/` e, se existir, adiciona `_2`, `_3`, etc.
-        """
         candidato_key = f"{base_prefix}/{filename}"
         if not self._s3_objeto_existe(s3_client, bucket_name, candidato_key):
             return candidato_key
@@ -378,11 +498,6 @@ class Command(BaseCommand):
         processed_prefix: str,
         data_ref: datetime.date,
     ) -> str:
-        """
-        Move o PDF no Supabase Storage de `novos_diarios/{arquivo.pdf}` para
-        `diarios_processados/{YYYY}/{MM}/{arquivo.pdf}` (garantindo nome único sem sobrescrever)
-        e retorna o link público.
-        """
         filename = source_key.split("/")[-1]
         prefix_limpo = processed_prefix.strip("/")
         ano = f"{data_ref.year:04d}"
@@ -408,15 +523,11 @@ class Command(BaseCommand):
         return f"{base_public_url}/{bucket_name}/{encoded_dest_key}"
 
     # --------------------------------------------------------------------------
-    # Métodos Auxiliares: PyMuPDF + Regex + Gemini
+    # Métodos Auxiliares: PyMuPDF + Regex + Super-Batching Gemini
     # --------------------------------------------------------------------------
     def _extrair_paginas_promissoras(
         self, pdf_bytes: bytes
     ) -> List[tuple[int, str, List[str]]]:
-        """
-        Abre o PDF em memória com PyMuPDF (fitz) e retorna apenas as páginas cujo texto
-        casa com o Regex do nosso nicho de negócio.
-        """
         paginas_filtradas: List[tuple[int, str, List[str]]] = []
 
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
@@ -437,19 +548,72 @@ class Command(BaseCommand):
 
         return paginas_filtradas
 
-    def _extrair_licitacoes_com_gemini(
+    def _formatar_bloco_documento(
         self,
-        indice_arquivo: int,
+        doc_id: str,
         nome_arquivo: str,
         paginas_promissoras: List[tuple[int, str, List[str]]],
+    ) -> str:
+        linhas = [
+            "======================================================================",
+            f"INÍCIO DO DOCUMENTO [{doc_id}] | ARQUIVO: {nome_arquivo}",
+            "======================================================================",
+        ]
+        for num_pag, texto, termos in paginas_promissoras:
+            linhas.append(
+                f"=== [{doc_id}] PÁGINA {num_pag} (Termos detectados: {', '.join(termos)}) ===\n{texto}"
+            )
+        linhas.append(f"=== FIM DO DOCUMENTO [{doc_id}] ({nome_arquivo}) ===")
+        return "\n\n".join(linhas)
+
+    def _agrupar_em_superbatches(
+        self, candidatos: List[CandidatoGemini]
+    ) -> List[List[CandidatoGemini]]:
+        """
+        Agrupa múltiplos PDFs filtrados em Super-Batches respeitando:
+        - `GEMINI_SUPERBATCH_MAX_CHARS` (padrão 450.000 chars ≈ 112.000 tokens, metade da janela de 250K TPM)
+        - `GEMINI_SUPERBATCH_MAX_FILES` (padrão 5 PDFs por requisição)
+        """
+        max_chars = int(getattr(settings, "GEMINI_SUPERBATCH_MAX_CHARS", 450_000))
+        max_files = int(getattr(settings, "GEMINI_SUPERBATCH_MAX_FILES", 5))
+
+        superbatches: List[List[CandidatoGemini]] = []
+        lote_atual: List[CandidatoGemini] = []
+        chars_atual = 0
+
+        for cand in candidatos:
+            tam_cand = len(cand.bloco_texto)
+            cabe_no_lote = (
+                len(lote_atual) < max_files
+                and (chars_atual + tam_cand) <= max_chars
+            )
+            if lote_atual and not cabe_no_lote:
+                superbatches.append(lote_atual)
+                lote_atual = []
+                chars_atual = 0
+
+            lote_atual.append(cand)
+            chars_atual += tam_cand
+
+        if lote_atual:
+            superbatches.append(lote_atual)
+
+        return superbatches
+
+    def _chamar_gemini_com_fallback(
+        self,
+        indice_progresso: int,
+        rotulo_progresso: str,
+        prompt: str,
+        arquivos_no_lote: int,
     ) -> List[LicitacaoExtraidaSchema]:
-        """
-        Envia exclusivamente o texto das páginas pré-filtradas pelo Regex para a API
-        do Google Gemini com balanceamento inteligente de cotas (RPM / TPM / RPD)
-        baseado em `Docs_Vault/Arquitetura/ANOTAÇÕES.md`.
-        """
+        """Executa 1 chamada ao Google Gemini respeitando cadência mínima e fallback de modelos."""
         chave_api = (settings.GEMINI_API_KEY or "").strip()
-        if not chave_api or "COLE_AQUI" in chave_api.upper() or "SUA-CHAVE" in chave_api.upper():
+        if (
+            not chave_api
+            or "COLE_AQUI" in chave_api.upper()
+            or "SUA-CHAVE" in chave_api.upper()
+        ):
             raise RuntimeError(
                 "API_KEY_INVALID: A variável GEMINI_API_KEY no Coolify está vazia ou com o texto de exemplo "
                 "('COLE_AQUI_SUA_CHAVE_DO_GEMINI'). Cole sua chave real (AQ.Ab8RN6...) nas Environment Variables do EPSL no Coolify."
@@ -462,28 +626,6 @@ class Command(BaseCommand):
             ),
         )
 
-        blocos_paginas = []
-        for num_pag, texto, termos in paginas_promissoras:
-            blocos_paginas.append(
-                f"=== PÁGINA {num_pag} (Termos detectados: {', '.join(termos)}) ===\n{texto}"
-            )
-        conteudo_paginas = "\n\n".join(blocos_paginas)
-
-        prompt = (
-            "Você é um especialista em análise de Diários Oficiais e Licitações Públicas no Brasil.\n"
-            f"Abaixo estão as páginas pré-filtradas do arquivo '{nome_arquivo}'.\n"
-            "Identifique TODAS as licitações, avisos de edital, pregões, chamadas públicas, dispensas ou "
-            "contratações que tenham relação com nosso nicho: Tecnologia, Computação, Computadores, "
-            "Laboratórios de Informática, TI, Tecnologia da Informação, Manutenção de Computadores, "
-            "Livros Didáticos, Formação em Computação, Software, Hardware ou Infraestrutura de TI.\n\n"
-            "Regras importantes:\n"
-            "1. Ignore atos administrativos sem relação com compras/contratações/licitações (ex: nomeações de cargos).\n"
-            "2. Se uma mesma licitação começar em uma página e continuar na seguinte, consolide em um único item "
-            "e informe ambas as páginas em 'paginas_referencia' (ex: '14, 15').\n"
-            "3. Caso nenhuma licitação válida do nosso nicho esteja presente nas páginas, retorne a lista vazia.\n\n"
-            f"{conteudo_paginas}"
-        )
-
         modelos_ordenados = ordenar_modelos_para_chamada()
         response = None
         ultimo_erro = None
@@ -493,23 +635,22 @@ class Command(BaseCommand):
             rpm_limite = info_modelo["rpm_limite"]
             rpd_limite = info_modelo["rpd_limite"]
 
-            # Se este modelo atingiu o limite por minuto (RPM), verifica se há outro livre; se for o último, aguarda a janela
             espera_seg = aguardar_slot_rpm_se_necessario(modelo_atual, rpm_limite)
             if espera_seg > 0:
                 self._log(
-                    f"   [Rate Limit RPM] Aguardando {espera_seg:.1f}s para liberar janela de {rpm_limite} RPM do modelo '{modelo_atual}'..."
+                    f"   [Cadência Econômica] Aguardando {espera_seg:.1f}s antes da próxima chamada ao modelo '{modelo_atual}'..."
                 )
                 atualizar_etapa_arquivo(
-                    indice_arquivo,
-                    nome_arquivo,
-                    f"Aguardando janela de RPM ({espera_seg:.0f}s) para {modelo_atual}...",
+                    indice_progresso,
+                    rotulo_progresso,
+                    f"Pausa econômica de {espera_seg:.0f}s (preservando RPM/TPM de {modelo_atual})...",
                 )
                 time.sleep(espera_seg)
 
             atualizar_etapa_arquivo(
-                indice_arquivo,
-                nome_arquivo,
-                f"Analisando páginas com IA ({modelo_atual} | Limite: {rpm_limite} RPM / {rpd_limite} RPD)...",
+                indice_progresso,
+                rotulo_progresso,
+                f"Consultando IA em Super-Batch ({modelo_atual} | {arquivos_no_lote} PDF(s) na mesma chamada)...",
             )
 
             try:
@@ -522,10 +663,10 @@ class Command(BaseCommand):
                         temperature=0.1,
                     ),
                 )
-                registrar_uso_modelo(modelo_atual)
+                registrar_uso_modelo(modelo_atual, arquivos_no_lote=arquivos_no_lote)
                 self._log(
-                    f"   Extraído com sucesso utilizando o modelo: {modelo_atual} "
-                    f"(RPM: {info_modelo['rpm_usado'] + 1}/{rpm_limite} | RPD: {info_modelo['rpd_usado'] + 1}/{rpd_limite})"
+                    f"   Super-Batch analisado com sucesso pelo modelo '{modelo_atual}' "
+                    f"(1 requisição para {arquivos_no_lote} PDF(s) | RPM: {info_modelo['rpm_usado'] + 1}/{rpm_limite} | RPD: {info_modelo['rpd_usado'] + 1}/{rpd_limite})"
                 )
                 break
             except Exception as exc:
@@ -537,16 +678,21 @@ class Command(BaseCommand):
                         "(verifique se ficou como 'COLE_AQUI_SUA_CHAVE_DO_GEMINI' e substitua por sua chave real 'AQ.Ab8RN6...')."
                     ) from exc
 
-                # Se for erro 429 (Quota/RPM) ou 503 (High Demand), aplica cooldown no modelo e pula para o próximo da tabela
-                cooldown_seg = 60.0 if "429" in erro_str or "RESOURCE_EXHAUSTED" in erro_str else 25.0
+                cooldown_seg = (
+                    65.0
+                    if "429" in erro_str or "RESOURCE_EXHAUSTED" in erro_str
+                    else 30.0
+                )
                 registrar_cooldown_modelo(modelo_atual, segundos=cooldown_seg)
                 self._log(
-                    f"   [Fallback de Cota] Modelo '{modelo_atual}' ocupado/limite atingido ({erro_str[:110]}). Alternando para o próximo modelo...",
+                    f"   [Fallback de Cota] Modelo '{modelo_atual}' indisponível/ocupado ({erro_str[:110]}). Alternando para o próximo modelo...",
                     style_func=self.style.WARNING,
                 )
 
         if response is None:
-            raise RuntimeError(f"Todos os modelos Gemini falharam. Último erro: {ultimo_erro}")
+            raise RuntimeError(
+                f"Todos os modelos Gemini falharam. Último erro: {ultimo_erro}"
+            )
 
         if not response.text:
             return []
@@ -554,8 +700,117 @@ class Command(BaseCommand):
         resultado = ResultadoExtracaoDiarioSchema.model_validate_json(response.text)
         return resultado.licitacoes
 
+    def _extrair_superbatch_com_gemini(
+        self,
+        idx_lote: int,
+        total_lotes: int,
+        lote: List[CandidatoGemini],
+    ) -> Dict[str, List[LicitacaoExtraidaSchema]]:
+        """
+        Envia um Super-Batch (1 ou mais PDFs) para o Gemini.
+        Caso um único PDF seja extraordinariamente grande (> `GEMINI_SUPERBATCH_MAX_CHARS`),
+        divide suas páginas em sub-fatias seguras dentro do limite de 250K TPM.
+        """
+        max_chars = int(getattr(settings, "GEMINI_SUPERBATCH_MAX_CHARS", 450_000))
+        mapa_resultado: Dict[str, List[LicitacaoExtraidaSchema]] = {
+            c.doc_id: [] for c in lote
+        }
+
+        # Caso especial: 1 único PDF cujas páginas somadas ultrapassam max_chars
+        if len(lote) == 1 and len(lote[0].bloco_texto) > max_chars:
+            cand = lote[0]
+            fatias: List[List[tuple[int, str, List[str]]]] = []
+            fatia_atual: List[tuple[int, str, List[str]]] = []
+            chars_fatia = 0
+            for pag in cand.paginas_promissoras:
+                tam_pag = len(pag[1]) + 120
+                if fatia_atual and (chars_fatia + tam_pag) > max_chars:
+                    fatias.append(fatia_atual)
+                    fatia_atual = []
+                    chars_fatia = 0
+                fatia_atual.append(pag)
+                chars_fatia += tam_pag
+            if fatia_atual:
+                fatias.append(fatia_atual)
+
+            self._log(
+                f"   Arquivo extenso '{cand.nome_arquivo}' dividido em {len(fatias)} fatia(s) de contexto."
+            )
+            for idx_f, pags_fatia in enumerate(fatias, start=1):
+                bloco_parcial = self._formatar_bloco_documento(
+                    cand.doc_id, cand.nome_arquivo, pags_fatia
+                )
+                prompt = self._montar_prompt_superbatch([cand], bloco_parcial)
+                extraidas = self._chamar_gemini_com_fallback(
+                    indice_progresso=cand.indice_arquivo,
+                    rotulo_progresso=f"{cand.nome_arquivo} (Parte {idx_f}/{len(fatias)})",
+                    prompt=prompt,
+                    arquivos_no_lote=1,
+                )
+                mapa_resultado[cand.doc_id].extend(extraidas)
+            return mapa_resultado
+
+        # Caso padrão: Múltiplos PDFs combinados em um único Super-Batch!
+        conteudo_combinado = "\n\n".join(c.bloco_texto for c in lote)
+        prompt = self._montar_prompt_superbatch(lote, conteudo_combinado)
+        rotulo = (
+            lote[0].nome_arquivo
+            if len(lote) == 1
+            else f"Super-Batch {idx_lote}/{total_lotes} ({len(lote)} PDFs)"
+        )
+        todas_extraidas = self._chamar_gemini_com_fallback(
+            indice_progresso=lote[-1].indice_arquivo,
+            rotulo_progresso=rotulo,
+            prompt=prompt,
+            arquivos_no_lote=len(lote),
+        )
+
+        if len(lote) == 1:
+            mapa_resultado[lote[0].doc_id] = todas_extraidas
+            return mapa_resultado
+
+        # Mapeia cada licitação de volta para o seu PDF de origem via `documento_id`
+        mapa_por_nome = {c.nome_arquivo.lower(): c.doc_id for c in lote}
+        for item in todas_extraidas:
+            raw_id = (item.documento_id or "").strip().upper().replace("[", "").replace("]", "")
+            if raw_id in mapa_resultado:
+                mapa_resultado[raw_id].append(item)
+            elif f"DOC_{raw_id}" in mapa_resultado:
+                mapa_resultado[f"DOC_{raw_id}"].append(item)
+            elif item.documento_id.strip().lower() in mapa_por_nome:
+                doc_key = mapa_por_nome[item.documento_id.strip().lower()]
+                mapa_resultado[doc_key].append(item)
+            else:
+                # Fallback seguro para o primeiro documento do lote caso a IA omita o ID
+                mapa_resultado[lote[0].doc_id].append(item)
+
+        return mapa_resultado
+
+    def _montar_prompt_superbatch(
+        self, lote: List[CandidatoGemini], conteudo_combinado: str
+    ) -> str:
+        resumo_docs = "\n".join(
+            f"- [{c.doc_id}] Arquivo: {c.nome_arquivo}" for c in lote
+        )
+        return (
+            "Você é um especialista em análise de Diários Oficiais e Licitações Públicas no Brasil.\n"
+            f"Abaixo estão as páginas pré-filtradas de {len(lote)} Diário(s) Oficial(is):\n"
+            f"{resumo_docs}\n\n"
+            "Identifique TODAS as licitações, avisos de edital, pregões, chamadas públicas, dispensas ou "
+            "contratações que tenham relação com nosso nicho: Tecnologia, Computação, Computadores, "
+            "Laboratórios de Informática, TI, Tecnologia da Informação, Manutenção de Computadores, "
+            "Livros Didáticos, Formação em Computação, Software, Hardware ou Infraestrutura de TI.\n\n"
+            "Regras importantes:\n"
+            "1. Preencha obrigatoriamente 'documento_id' com o código exato do documento de origem "
+            "(ex: 'DOC_1', 'DOC_2') indicado no cabeçalho 'INÍCIO DO DOCUMENTO [DOC_X]'.\n"
+            "2. Ignore atos administrativos sem relação com compras/contratações/licitações (ex: nomeações de cargos).\n"
+            "3. Se uma mesma licitação começar em uma página e continuar na seguinte dentro do mesmo documento, "
+            "consolide em um único item e informe ambas as páginas em 'paginas_referencia' (ex: '14, 15').\n"
+            "4. Caso nenhuma licitação válida do nosso nicho esteja presente, retorne a lista vazia.\n\n"
+            f"{conteudo_combinado}"
+        )
+
     def _parse_data_publicacao(self, data_str: str) -> datetime.date:
-        """Converte a data retornada pela IA (YYYY-MM-DD ou DD/MM/YYYY) em `datetime.date`."""
         for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
             try:
                 return datetime.datetime.strptime(data_str.strip(), fmt).date()
@@ -570,7 +825,6 @@ class Command(BaseCommand):
         bucket_name: str,
         object_key: str,
     ) -> bytes:
-        """Lê os bytes do PDF a partir da pasta local (teste) ou do Supabase Storage (deploy)."""
         if use_local:
             return Path(object_key).read_bytes()
         assert s3_client is not None
@@ -586,7 +840,6 @@ class Command(BaseCommand):
         processed_prefix: str,
         data_ref: datetime.date,
     ) -> str:
-        """Move o PDF processado na pasta local (teste) ou no Supabase Storage (deploy)."""
         if use_local:
             return self._mover_pdf_local_para_processados(
                 source_path_str=object_key,
@@ -609,7 +862,6 @@ class Command(BaseCommand):
         bucket_name: str,
         object_key: str,
     ) -> None:
-        """Remove de `novos_diarios/` um PDF que foi identificado como duplicata de outro já processado."""
         if use_local:
             p = Path(object_key)
             if p.exists():
@@ -619,20 +871,21 @@ class Command(BaseCommand):
         s3_client.delete_object(Bucket=bucket_name, Key=object_key)
 
     # --------------------------------------------------------------------------
-    # Orquestração por Arquivo PDF
+    # Fase 1 (Triagem Local) e Fase 2 (Arquivamento Pós-Super-Batch)
     # --------------------------------------------------------------------------
-    def _processar_arquivo_pdf(
+    def _triar_arquivo_localmente(
         self,
         indice_arquivo: int,
+        doc_seq: int,
         use_local: bool,
         s3_client: Optional[BaseClient],
         bucket_name: str,
         object_key: str,
         processed_prefix: str,
         dry_run: bool = False,
-    ) -> None:
+    ) -> Optional[CandidatoGemini]:
         nome_arquivo = Path(object_key).name
-        self._log(f"\n-> [{indice_arquivo}] Lendo '{object_key}'...")
+        self._log(f"\n-> [{indice_arquivo}] Triagem local de '{object_key}'...")
         pdf_bytes = self._ler_bytes_pdf(
             use_local=use_local,
             s3_client=s3_client,
@@ -642,9 +895,10 @@ class Command(BaseCommand):
 
         # Passo 0: Deduplicação Dupla (Hash Binário SHA-256 + Hash do Conteúdo Textual Normalizado)
         atualizar_etapa_arquivo(
-            indice_arquivo, nome_arquivo, "Verificando autenticidade SHA-256 (anti-duplicata)..."
+            indice_arquivo,
+            nome_arquivo,
+            "Verificando autenticidade SHA-256 (anti-duplicata)...",
         )
-        sincronizar_hashes_locais_existentes()
         sha256_arquivo = calcular_sha256_bytes(pdf_bytes)
         sha256_texto, total_paginas = calcular_sha256_texto_pdf(pdf_bytes)
 
@@ -665,7 +919,7 @@ class Command(BaseCommand):
                 f"   [DUPLICADO BLOQUEADO - ECONOMIA DE IA] O arquivo '{nome_arquivo}' "
                 f"é idêntico ao diário já processado '{duplicado_db.nome_arquivo}' "
                 f"({tipo_match} | Processado em: {data_proc_str}).\n"
-                f"   -> Envio ao Google Gemini CANCELADO para evitar custo duplicado de IA!",
+                f"   -> Envio ao Google Gemini CANCELADO (0 RPM / 0 RPD gastos)!",
                 style_func=self.style.WARNING,
             )
             if not dry_run:
@@ -675,22 +929,21 @@ class Command(BaseCommand):
                     bucket_name=bucket_name,
                     object_key=object_key,
                 )
-                self._log(
-                    f"   -> Cópia redundante removida de 'novos_diarios/'. Documento original mantido em: {duplicado_db.link_documento}"
-                )
-            concluir_um_arquivo(foi_duplicado=True)
-            return
+            concluir_um_arquivo(nome_arquivo=nome_arquivo, foi_duplicado=True)
+            return None
 
         # Passo 1: PyMuPDF + Regex
         atualizar_etapa_arquivo(
-            indice_arquivo, nome_arquivo, f"Filtrando {total_paginas} página(s) com PyMuPDF + Regex..."
+            indice_arquivo,
+            nome_arquivo,
+            f"Filtrando {total_paginas} página(s) com PyMuPDF + Regex...",
         )
         paginas_promissoras = self._extrair_paginas_promissoras(pdf_bytes)
         nums_paginas = [str(p[0]) for p in paginas_promissoras]
 
         if not paginas_promissoras:
             self._log(
-                f"   Nenhuma página de '{object_key}' conteve palavras-chave do nicho.",
+                f"   Nenhuma página de '{object_key}' conteve palavras-chave do nicho (0 chamadas IA).",
                 style_func=self.style.WARNING,
             )
             if not dry_run:
@@ -711,53 +964,68 @@ class Command(BaseCommand):
                     qtd_licitacoes=0,
                     link_documento=link_arquivado,
                 )
-                self._log(
-                    f"   PDF arquivado sem ocorrências em: {link_arquivado}"
-                )
-            concluir_um_arquivo(licitacoes_adicionadas=0)
-            return
+                self._log(f"   PDF arquivado sem ocorrências em: {link_arquivado}")
+            concluir_um_arquivo(nome_arquivo=nome_arquivo, sem_match_regex=True)
+            return None
 
+        doc_id = f"DOC_{doc_seq}"
+        bloco_texto = self._formatar_bloco_documento(
+            doc_id=doc_id,
+            nome_arquivo=nome_arquivo,
+            paginas_promissoras=paginas_promissoras,
+        )
         self._log(
-            f"   Filtro Regex encontrou indícios nas páginas: {', '.join(nums_paginas)}",
+            f"   [{doc_id}] Filtro Regex capturou {len(paginas_promissoras)} página(s) ({', '.join(nums_paginas)}) "
+            f"[{len(bloco_texto):,} chars] -> Adicionado ao Super-Batch!",
             style_func=self.style.SUCCESS,
         )
 
         if dry_run:
-            self._log(
-                "   [DRY-RUN] Pulando chamada ao Gemini e escrita no banco/Storage.",
-                style_func=self.style.NOTICE,
-            )
-            concluir_um_arquivo(licitacoes_adicionadas=0)
-            return
+            concluir_um_arquivo(nome_arquivo=nome_arquivo, licitacoes_adicionadas=0)
+            return None
 
-        # Passo 2: Chamada ao Google Gemini com as páginas promissoras
-        licitacoes_extraidas = self._extrair_licitacoes_com_gemini(
+        return CandidatoGemini(
             indice_arquivo=indice_arquivo,
+            doc_id=doc_id,
+            object_key=object_key,
             nome_arquivo=nome_arquivo,
+            tamanho_bytes=len(pdf_bytes),
+            sha256_arquivo=sha256_arquivo,
+            sha256_texto=sha256_texto,
+            total_paginas=total_paginas,
             paginas_promissoras=paginas_promissoras,
+            bloco_texto=bloco_texto,
         )
 
-        # Define a data de referência para a pasta {YYYY}/{MM}
+    def _finalizar_e_arquivar_candidato(
+        self,
+        cand: CandidatoGemini,
+        licitacoes_extraidas: List[LicitacaoExtraidaSchema],
+        use_local: bool,
+        s3_client: Optional[BaseClient],
+        bucket_name: str,
+        processed_prefix: str,
+    ) -> None:
         data_referencia = (
             self._parse_data_publicacao(licitacoes_extraidas[0].data_publicacao)
             if licitacoes_extraidas
             else datetime.date.today()
         )
 
-        # Passo 3: Move o PDF para diarios_processados/{YYYY}/{MM}/{arquivo.pdf}
         atualizar_etapa_arquivo(
-            indice_arquivo, nome_arquivo, "Movendo PDF para diarios_processados/ e salvando no banco..."
+            cand.indice_arquivo,
+            cand.nome_arquivo,
+            "Movendo PDF para diarios_processados/ e salvando licitações no banco...",
         )
         link_documento = self._mover_pdf_processado(
             use_local=use_local,
             s3_client=s3_client,
             bucket_name=bucket_name,
-            object_key=object_key,
+            object_key=cand.object_key,
             processed_prefix=processed_prefix,
             data_ref=data_referencia,
         )
 
-        # Passo 4: Salva os registros estruturados no banco e registra o Hash Anti-Duplicata
         qtd_salvas = 0
         if licitacoes_extraidas:
             objetos_para_salvar = [
@@ -777,22 +1045,25 @@ class Command(BaseCommand):
                 qtd_salvas = len(objetos_para_salvar)
 
             self._log(
-                f"   [OK] {qtd_salvas} licitação(ões) salva(s) | PDF movido para: {link_documento}",
+                f"   [OK] [{cand.doc_id}] '{cand.nome_arquivo}': {qtd_salvas} licitação(ões) salva(s) | PDF movido para: {link_documento}",
                 style_func=self.style.SUCCESS,
             )
         else:
             self._log(
-                f"   Gemini analisou as páginas mas descartou como falso-positivo. PDF movido para: {link_documento}",
+                f"   [{cand.doc_id}] '{cand.nome_arquivo}': Gemini descartou páginas como falso-positivo. PDF movido para: {link_documento}",
                 style_func=self.style.WARNING,
             )
 
         registrar_diario_processado(
             nome_arquivo=Path(link_documento).name,
-            sha256_arquivo=sha256_arquivo,
-            sha256_texto=sha256_texto,
-            tamanho_bytes=len(pdf_bytes),
-            total_paginas=total_paginas,
+            sha256_arquivo=cand.sha256_arquivo,
+            sha256_texto=cand.sha256_texto,
+            tamanho_bytes=cand.tamanho_bytes,
+            total_paginas=cand.total_paginas,
             qtd_licitacoes=qtd_salvas,
             link_documento=link_documento,
         )
-        concluir_um_arquivo(licitacoes_adicionadas=qtd_salvas)
+        concluir_um_arquivo(
+            nome_arquivo=cand.nome_arquivo,
+            licitacoes_adicionadas=qtd_salvas,
+        )

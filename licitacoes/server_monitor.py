@@ -20,6 +20,7 @@ from django.db import connection
 from django.db.models import Count
 
 from licitacoes.models import Licitacao
+from licitacoes.pipeline_progress import obter_snapshot_progresso
 from licitacoes.storage_upload import _obter_s3_client, s3_credenciais_validas
 
 # Cache leve em memória para evitar listagens pesadas no S3 a cada 3 segundos de polling
@@ -312,6 +313,7 @@ def coletar_metricas_storage(forcar_atualizacao: bool = False) -> Dict[str, Any]
     processados_qtd = 0
     processados_bytes = 0
     arquivos_recentes: List[Dict[str, Any]] = []
+    arquivos_aguardando: List[Dict[str, Any]] = []
     por_mes: Dict[str, Dict[str, int]] = {}
     status_storage = "Online"
     tipo_storage = (
@@ -340,6 +342,20 @@ def coletar_metricas_storage(forcar_atualizacao: bool = False) -> Dict[str, Any]
                         if key.startswith(f"{input_prefix}/"):
                             novos_qtd += 1
                             novos_bytes += size
+                            arquivos_aguardando.append(
+                                {
+                                    "nome": key.split("/")[-1],
+                                    "caminho": key,
+                                    "tamanho_human": formatar_bytes(size),
+                                    "modificado": (
+                                        last_mod.astimezone(timezone.utc).strftime(
+                                            "%d/%m/%Y %H:%M"
+                                        )
+                                        if last_mod
+                                        else "-"
+                                    ),
+                                }
+                            )
                         elif key.startswith(f"{processed_prefix}/"):
                             processados_qtd += 1
                             processados_bytes += size
@@ -385,12 +401,22 @@ def coletar_metricas_storage(forcar_atualizacao: bool = False) -> Dict[str, Any]
         todos_arquivos = []
 
         if dir_novos.exists():
-            for p in dir_novos.rglob("*.pdf"):
+            for p in sorted(dir_novos.rglob("*.pdf")):
                 if p.is_file():
                     st = p.stat()
                     novos_qtd += 1
                     novos_bytes += st.st_size
                     todos_arquivos.append((p, st.st_size, st.st_mtime, "Fila (novos_diarios)"))
+                    arquivos_aguardando.append(
+                        {
+                            "nome": p.name,
+                            "caminho": str(p.relative_to(root)) if root in p.parents else p.name,
+                            "tamanho_human": formatar_bytes(st.st_size),
+                            "modificado": datetime.fromtimestamp(st.st_mtime).strftime(
+                                "%d/%m/%Y %H:%M"
+                            ),
+                        }
+                    )
 
         if dir_proc.exists():
             for p in dir_proc.rglob("*.pdf"):
@@ -450,6 +476,7 @@ def coletar_metricas_storage(forcar_atualizacao: bool = False) -> Dict[str, Any]
         },
         "por_mes": resumo_meses,
         "arquivos_recentes": arquivos_recentes,
+        "arquivos_aguardando": arquivos_aguardando,
     }
 
     _STORAGE_CACHE["timestamp"] = agora
@@ -465,5 +492,6 @@ def obter_snapshot_completo(forcar_storage: bool = False) -> Dict[str, Any]:
         "discos": coletar_discos_servidor(),
         "banco": coletar_metricas_banco(),
         "storage": coletar_metricas_storage(forcar_atualizacao=forcar_storage),
+        "analise_ia": obter_snapshot_progresso(),
     }
 

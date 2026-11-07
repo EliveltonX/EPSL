@@ -1,6 +1,7 @@
 import html
 import io
 import json
+import re
 import threading
 from pathlib import Path
 
@@ -27,10 +28,39 @@ from django.views.decorators.http import require_GET, require_http_methods, requ
 from licitacoes.models import Licitacao
 from licitacoes.pipeline_progress import (
     iniciar_progresso,
+    limpar_historico_erros_arquivos,
     obter_snapshot_progresso,
 )
 from licitacoes.server_monitor import obter_snapshot_completo
 from licitacoes.storage_upload import gerar_lote_urls_upload, sanitizar_nome_pdf
+
+
+def _extrair_numeros_paginas(paginas_ref: str) -> list[int]:
+    """
+    Extrai os números inteiros de página de uma string como '14, 15' ou 'Pág. 8 e 9',
+    preservando a ordem e removendo duplicatas.
+    """
+    vistos: set[int] = set()
+    resultado: list[int] = []
+    for match in re.findall(r"\d+", paginas_ref or ""):
+        num = int(match)
+        if num > 0 and num not in vistos:
+            vistos.add(num)
+            resultado.append(num)
+    return resultado
+
+
+def _url_pdf_com_pagina(url_base: str, pagina: int) -> str:
+    """
+    Adiciona o fragmento padrão PDF Open Parameters (`#page=N`) ao link do documento
+    para que o visualizador de PDF do navegador abra diretamente na página da licitação.
+    """
+    base_sem_hash = (url_base or "").split("#")[0]
+    if not base_sem_hash:
+        return ""
+    if pagina > 0:
+        return f"{base_sem_hash}#page={pagina}"
+    return base_sem_hash
 
 
 @ensure_csrf_cookie
@@ -269,8 +299,14 @@ def painel_licitacoes(request: HttpRequest) -> HttpResponse:
             if len(item.objeto_licitacao) > 180
             else item.objeto_licitacao
         )
+        pags_item = _extrair_numeros_paginas(item.paginas_referencia)
+        pag_ini_item = pags_item[0] if pags_item else 1
+        link_pdf_com_pag = _url_pdf_com_pagina(item.link_documento, pag_ini_item)
+        rotulo_abrir_pdf = (
+            f"Abrir PDF (Pág. {pag_ini_item})" if pags_item else "Abrir PDF"
+        )
         linhas_html += f"""
-        <tr class="clickable-row" onclick="window.location.href='/licitacoes/{item.id}/'" title="Clique na linha para abrir os detalhes completos desta licitação">
+        <tr class="clickable-row" onclick="window.location.href='/licitacoes/{item.id}/'" title="Clique na linha para abrir os detalhes completos desta licitação já na página {pag_ini_item} do PDF">
             <td onclick="event.stopPropagation();">{select_tag_html}</td>
             <td><strong>{html.escape(item.cidade)}</strong></td>
             <td>{html.escape(item.orgao_emissor)}</td>
@@ -279,7 +315,7 @@ def painel_licitacoes(request: HttpRequest) -> HttpResponse:
             <td>{html.escape(objeto_resumo)}</td>
             <td>{html.escape(item.paginas_referencia)}</td>
             <td onclick="event.stopPropagation();">
-                <a href="{html.escape(item.link_documento)}" target="_blank" rel="noopener">Abrir PDF</a>
+                <a href="{html.escape(link_pdf_com_pag)}" target="_blank" rel="noopener">{rotulo_abrir_pdf}</a>
             </td>
         </tr>
         """
@@ -444,12 +480,34 @@ def quote_plus_safe(val: str) -> str:
 def detalhe_licitacao(request: HttpRequest, pk: int) -> HttpResponse:
     """
     Página de Detalhes (`/licitacoes/<int:pk>/`) para visualização aprofundada
-    de uma licitação e marcação de sua Tag pós-análise (`Favorito`, `Em Análise`,
-    `Sem Conformidade`, `Ignorado`).
+    de uma licitação, marcação de sua Tag pós-análise (`Favorito`, `Em Análise`,
+    `Sem Conformidade`, `Ignorado`) e abertura automática do PDF incorporado
+    diretamente na página correta da licitação (`#page=N`).
     """
     item = get_object_or_404(Licitacao, pk=pk)
     csrf_token = get_token(request)
     meta_atual = TAG_META.get(item.tag_analise, TAG_META[""])
+
+    paginas_lista = _extrair_numeros_paginas(item.paginas_referencia)
+    pagina_inicial = paginas_lista[0] if paginas_lista else 1
+    url_base_sem_hash = (item.link_documento or "").split("#")[0]
+    url_pdf_inicial = _url_pdf_com_pagina(url_base_sem_hash, pagina_inicial)
+
+    botoes_paginas_html = ""
+    if paginas_lista:
+        for idx_p, num_p in enumerate(paginas_lista):
+            cls_ativo = "page-btn-active" if idx_p == 0 else ""
+            icone_p = "🎯" if idx_p == 0 else "📄"
+            botoes_paginas_html += (
+                f'<button type="button" id="btn-pag-{num_p}" '
+                f'class="page-btn {cls_ativo}" onclick="irParaPaginaPdf({num_p})">'
+                f"{icone_p} Pág. {num_p}</button>"
+            )
+    else:
+        botoes_paginas_html = (
+            '<button type="button" id="btn-pag-1" class="page-btn page-btn-active" '
+            'onclick="irParaPaginaPdf(1)">📄 Pág. 1</button>'
+        )
 
     botoes_tags_html = ""
     for val, info in TAG_META.items():
@@ -491,6 +549,10 @@ def detalhe_licitacao(request: HttpRequest, pk: int) -> HttpResponse:
         .tag-analise {{ background: #dbeafe; color: #1e40af; }}
         .tag-inconformidade {{ background: #fee2e2; color: #991b1b; }}
         .tag-ignorado {{ background: #e5e7eb; color: #374151; }}
+        .pdf-nav-bar {{ display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; background: #eff6ff; border: 1px solid #bfdbfe; padding: 10px 14px; border-radius: 10px; margin-bottom: 12px; }}
+        .page-btn {{ padding: 6px 12px; border-radius: 8px; border: 1px solid #93c5fd; background: #ffffff; color: #1e40af; font-weight: 700; font-size: 0.86rem; cursor: pointer; transition: all 0.15s; }}
+        .page-btn:hover {{ background: #dbeafe; }}
+        .page-btn-active {{ background: #2563eb !important; color: #ffffff !important; border-color: #1d4ed8 !important; }}
     </style>
 </head>
 <body>
@@ -503,7 +565,7 @@ def detalhe_licitacao(request: HttpRequest, pk: int) -> HttpResponse:
         </div>
         <div style="display:flex; gap:10px;">
             <a href="/licitacoes/" class="btn btn-secondary">← Voltar para a Lista de Licitações</a>
-            <a href="{html.escape(item.link_documento)}" target="_blank" rel="noopener" class="btn btn-primary">📄 Abrir PDF Original em Nova Aba</a>
+            <a id="linkTopoPdf" href="{html.escape(url_pdf_inicial)}" target="_blank" rel="noopener" class="btn btn-primary">📄 Abrir PDF Original (Pág. {pagina_inicial})</a>
         </div>
     </div>
 
@@ -548,15 +610,31 @@ def detalhe_licitacao(request: HttpRequest, pk: int) -> HttpResponse:
     </div>
 
     <div class="card">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-            <h3 style="margin:0;">📖 Visualização do Diário Oficial (Páginas de referência: {html.escape(item.paginas_referencia)})</h3>
-            <a href="{html.escape(item.link_documento)}" target="_blank" rel="noopener" class="btn btn-secondary">Abrir em Tela Cheia ↗</a>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:10px;">
+            <h3 style="margin:0;">📖 Visualização do Diário Oficial — Aberto na Página <span id="lblPaginaAtual">{pagina_inicial}</span> (Ref: {html.escape(item.paginas_referencia)})</h3>
+            <a id="linkTelaCheiaPdf" href="{html.escape(url_pdf_inicial)}" target="_blank" rel="noopener" class="btn btn-secondary">Abrir Página {pagina_inicial} em Tela Cheia ↗</a>
         </div>
-        <iframe src="{html.escape(item.link_documento)}" style="width:100%; height:620px; border:1px solid #d1d5db; border-radius:8px;"></iframe>
+
+        <div class="pdf-nav-bar">
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                <span style="font-size:0.88rem; font-weight:700; color:#1e3a8a;">Ir para página da licitação:</span>
+                {botoes_paginas_html}
+            </div>
+            <div style="display:flex; align-items:center; gap:6px;">
+                <label for="inputIrPagina" style="font-size:0.85rem; color:#1e3a8a; font-weight:600;">Pular p/ pág:</label>
+                <input type="number" id="inputIrPagina" min="1" value="{pagina_inicial}" style="width:72px; padding:5px 8px; border:1px solid #93c5fd; border-radius:6px; font-weight:600;">
+                <button type="button" class="page-btn" onclick="irParaPaginaPdf(parseInt(document.getElementById('inputIrPagina').value || '1', 10))">Ir</button>
+            </div>
+        </div>
+
+        <div id="containerPdfEmbed">
+            <iframe id="iframePdfDocumento" src="{html.escape(url_pdf_inicial)}" style="width:100%; height:650px; border:1px solid #d1d5db; border-radius:8px;"></iframe>
+        </div>
     </div>
 
     <script>
         const csrfToken = "{csrf_token}";
+        const urlBasePdf = {json.dumps(url_base_sem_hash)};
         const metaPorTag = {{
             "": {{ label: "Sem Marcação", icon: "⚪", cls: "tag-none" }},
             "favorito": {{ label: "Favorito", icon: "⭐", cls: "tag-favorito" }},
@@ -564,6 +642,35 @@ def detalhe_licitacao(request: HttpRequest, pk: int) -> HttpResponse:
             "sem_conformidade": {{ label: "Sem Conformidade", icon: "⚠️", cls: "tag-inconformidade" }},
             "ignorado": {{ label: "Ignorado", icon: "🚫", cls: "tag-ignorado" }}
         }};
+
+        function irParaPaginaPdf(numPagina) {{
+            const pag = Math.max(1, parseInt(numPagina, 10) || 1);
+            const novaUrl = urlBasePdf + "#page=" + pag;
+
+            document.getElementById("lblPaginaAtual").textContent = pag;
+            document.getElementById("inputIrPagina").value = pag;
+
+            const linkTopo = document.getElementById("linkTopoPdf");
+            if (linkTopo) {{
+                linkTopo.href = novaUrl;
+                linkTopo.textContent = `📄 Abrir PDF Original (Pág. ${{pag}})`;
+            }}
+            const linkCheia = document.getElementById("linkTelaCheiaPdf");
+            if (linkCheia) {{
+                linkCheia.href = novaUrl;
+                linkCheia.textContent = `Abrir Página ${{pag}} em Tela Cheia ↗`;
+            }}
+
+            document.querySelectorAll(".pdf-nav-bar .page-btn").forEach(b => b.classList.remove("page-btn-active"));
+            const btnPag = document.getElementById("btn-pag-" + pag);
+            if (btnPag) btnPag.classList.add("page-btn-active");
+
+            // Recria o elemento iframe para forçar o leitor nativo de PDF do navegador a saltar para #page=N
+            const container = document.getElementById("containerPdfEmbed");
+            if (container) {{
+                container.innerHTML = `<iframe id="iframePdfDocumento" src="${{novaUrl}}" style="width:100%; height:650px; border:1px solid #d1d5db; border-radius:8px;"></iframe>`;
+            }}
+        }}
 
         async function definirTagDetalhe(novaTag) {{
             const resp = await fetch("/licitacoes/{item.id}/tag/", {{
@@ -1331,7 +1438,8 @@ def receber_stream_pdf_local(request: HttpRequest, filename: str) -> JsonRespons
 def metricas_servidor_json(request: HttpRequest) -> JsonResponse:
     """
     Endpoint JSON (`/licitacoes/servidor/metricas/`) consumido a cada 3 segundos
-    pela Dashboard do Servidor para atualizar CPU, RAM, Discos, Processos, Banco e Supabase Storage.
+    pela Dashboard do Servidor para atualizar CPU, RAM, Discos, Processos, Banco,
+    Supabase Storage, Fila de Artigos Aguardando Análise e Histórico de Erros.
     Aceita `?refresh_storage=1` para forçar recontagem imediata do bucket S3 / pasta local.
     """
     forcar_storage = request.GET.get("refresh_storage") == "1"
@@ -1340,11 +1448,22 @@ def metricas_servidor_json(request: HttpRequest) -> JsonResponse:
 
 
 @login_required
+@require_POST
+def limpar_erros_analise_json(request: HttpRequest) -> JsonResponse:
+    """Limpa a lista persistente de artigos que apresentaram erro de análise."""
+    limpar_historico_erros_arquivos()
+    return JsonResponse({"status": "sucesso"})
+
+
+@login_required
+@ensure_csrf_cookie
 @require_GET
 def painel_servidor(request: HttpRequest) -> HttpResponse:
     """
-    Dashboard de Monitoramento do Servidor e Storage (`/licitacoes/servidor/`)
+    Dashboard de Monitoramento do Servidor, Storage e Fila de Análise IA (`/licitacoes/servidor/`)
     inspirada no Gerenciador de Tarefas do Windows:
+    - Status em tempo real da Análise IA, Agendador Automático (Cron 10 min), Super-Batching (250K TPM),
+      lista de Artigos Aguardando Análise (`novos_diarios/`) e Relatório de Artigos com Erro.
     - Gráficos históricos em tempo real (CPU % e RAM %) e uso individual por núcleo (vCPU).
     - Consumo de Memória RAM, Swap, Rede (TX/RX e velocidade instantânea) e Uptime.
     - Armazenamento físico do Servidor (partições e discos locais).
@@ -1353,6 +1472,7 @@ def painel_servidor(request: HttpRequest) -> HttpResponse:
     - Tabela de Top Processos ativos no servidor/container.
     """
     snapshot_inicial = json.dumps(obter_snapshot_completo(forcar_storage=False))
+    csrf_token = get_token(request)
     username_esc = html.escape(request.user.get_username())
 
     pagina_html = f"""<!DOCTYPE html>
@@ -1393,6 +1513,8 @@ def painel_servidor(request: HttpRequest) -> HttpResponse:
         th {{ background: #0f172a; color: #94a3b8; font-weight: 700; text-transform: uppercase; font-size: 0.75rem; }}
         .badge {{ display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 0.76rem; font-weight: 700; background: #1e3a8a; color: #93c5fd; }}
         .badge-live {{ background: #065f46; color: #6ee7b7; animation: pulse 2s infinite; }}
+        .badge-warn {{ background: #78350f; color: #fde68a; }}
+        .badge-err {{ background: #7f1d1d; color: #fecaca; }}
         @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.65; }} }}
         .disk-item {{ background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }}
         .muted {{ color: #94a3b8; font-size: 0.84rem; }}
@@ -1435,6 +1557,123 @@ def painel_servidor(request: HttpRequest) -> HttpResponse:
             <div class="kpi-label">🗄️ Banco de Dados (<span id="kpiDbEngine">DB</span>)</div>
             <div class="kpi-value" id="kpiDbSize">--</div>
             <div class="kpi-sub" id="kpiDbSub">-- licitações cadastradas</div>
+        </div>
+    </div>
+
+    <!-- NOVO PAINEL: Status da Análise IA, Agendador 10 min, Artigos Aguardando e Artigos com Erro -->
+    <div class="card" style="margin-bottom:18px; border-color:#3b82f6;">
+        <h2>
+            <span>🤖 Status da Análise IA, Agendador Automático (Cron 10 min) & Fila de Artigos</span>
+            <span id="badgeStatusAnalise" class="badge badge-live">Carregando...</span>
+        </h2>
+
+        <div class="grid-4" style="margin-top:12px; margin-bottom:14px;">
+            <div class="disk-item" style="margin:0;">
+                <div class="kpi-label">⏰ Próximo Ciclo Automático</div>
+                <div style="font-size:1.3rem; font-weight:800; color:#38bdf8; margin-top:4px;" id="txtProximoCiclo">--m --s</div>
+                <div class="muted" id="txtInfoScheduler">Verifica novos_diarios/ a cada 10 min</div>
+            </div>
+            <div class="disk-item" style="margin:0;">
+                <div class="kpi-label">📥 Artigos Aguardando Análise</div>
+                <div style="font-size:1.3rem; font-weight:800; color:#fbbf24; margin-top:4px;" id="txtFilaAguardandoQtd">0 artigo(s)</div>
+                <div class="muted" id="txtEstimativaTempo">Ritmo suave anti-bloqueio</div>
+            </div>
+            <div class="disk-item" style="margin:0;">
+                <div class="kpi-label">🚨 Artigos com Erro na Análise</div>
+                <div style="font-size:1.3rem; font-weight:800; color:#34d399; margin-top:4px;" id="txtErrosAnaliseQtd">0 erro(s)</div>
+                <div class="muted" id="txtErrosAnaliseSub">Nenhum artigo com falha</div>
+            </div>
+            <div class="disk-item" style="margin:0;">
+                <div class="kpi-label">🛡️ Economia Super-Batch (250K TPM)</div>
+                <div style="font-size:1.3rem; font-weight:800; color:#a78bfa; margin-top:4px;" id="txtEconomiaIa">0 req poupadas</div>
+                <div class="muted" id="txtSuperbatchesSub">0 chamadas IA realizadas</div>
+            </div>
+        </div>
+
+        <!-- Barra de Progresso ao Vivo (exibida durante ou após execução) -->
+        <div class="disk-item" style="margin-bottom:14px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                <div>
+                    <strong id="txtEtapaAnalise" style="color:#f8fafc;">Aguardando próximo ciclo...</strong>
+                    <span class="muted" id="txtArquivoAnalise" style="margin-left:8px;"></span>
+                </div>
+                <div style="display:flex; gap:8px; align-items:center;">
+                    <form method="post" action="/licitacoes/processar-web/" style="margin:0;">
+                        <input type="hidden" name="csrfmiddlewaretoken" value="{csrf_token}">
+                        <button type="submit" class="btn btn-primary" style="padding:6px 12px; font-size:0.82rem;">▶️ Executar Análise Agora</button>
+                    </form>
+                    <a href="/licitacoes/processar-web/" class="btn btn-secondary" style="padding:6px 12px; font-size:0.82rem;">📺 Abrir Console da IA</a>
+                </div>
+            </div>
+            <div class="bar-bg" style="height:14px; margin-top:8px;">
+                <div id="barProgressoIa" class="bar-fill bar-green" style="width:0%;"></div>
+            </div>
+            <div class="muted" style="margin-top:4px; display:flex; justify-content:space-between; flex-wrap:wrap;">
+                <span id="txtUltimoResumoCron">Último ciclo: --</span>
+                <span id="txtModeloAtivoIa">Modelo preferencial: gemini-3.5-flash-lite</span>
+            </div>
+        </div>
+
+        <div class="grid-2" style="margin-bottom:0;">
+            <!-- Coluna 1: Artigos Aguardando Análise em novos_diarios/ -->
+            <div class="disk-item" style="margin-bottom:0;">
+                <h3 style="margin-top:0; font-size:0.96rem;">
+                    <span>📥 Artigos Aguardando Análise (novos_diarios/)</span>
+                    <span id="badgeFilaCount" class="badge">0 na fila</span>
+                </h3>
+                <div style="max-height:230px; overflow-y:auto;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Artigo / Diário PDF</th>
+                                <th>Tamanho</th>
+                                <th>Enviado em</th>
+                                <th>Situação</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tbodyArtigosAguardando"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Coluna 2: Artigos que Tiveram Erro na Análise -->
+            <div class="disk-item" style="margin-bottom:0;">
+                <h3 style="margin-top:0; font-size:0.96rem;">
+                    <span>🚨 Histórico de Artigos com Erro na Análise</span>
+                    <button id="btnLimparErros" type="button" class="btn btn-secondary" style="padding:3px 9px; font-size:0.75rem; display:none;" onclick="limparErrosAnalise()">🧹 Limpar Avisos</button>
+                </h3>
+                <div style="max-height:230px; overflow-y:auto;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Artigo PDF</th>
+                                <th>Tentativas</th>
+                                <th>Horário</th>
+                                <th>Motivo do Erro</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tbodyArtigosComErro"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tabela Compacta de Cotas RPM / RPD dos Modelos Gemini -->
+        <div style="margin-top:14px;">
+            <h3 style="margin-bottom:4px; font-size:0.94rem;">📊 Uso Atual das Cotas Google AI Studio (Balanceamento RPM / TPM / RPD)</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Prioridade</th>
+                        <th>Modelo Gemini</th>
+                        <th>Uso por Minuto (RPM)</th>
+                        <th>Janela de Contexto (TPM)</th>
+                        <th>Uso Diário (RPD)</th>
+                        <th>Disponibilidade</th>
+                    </tr>
+                </thead>
+                <tbody id="tbodyCotasServidor"></tbody>
+            </table>
         </div>
     </div>
 
@@ -1781,6 +2020,151 @@ def painel_servidor(request: HttpRequest) -> HttpResponse:
                     <td>${{p.rss_human}}</td>
                 </tr>
             `).join("");
+
+            // Status da Análise IA, Agendador 10 min, Artigos Aguardando e Artigos com Erro
+            const ia = snap.analise_ia || {{}};
+            const sched = ia.scheduler || {{}};
+            const arqAguardando = st.arquivos_aguardando || [];
+            const arqComErro = ia.lista_arquivos_com_erro || [];
+            const mapaErrosPorNome = {{}};
+            arqComErro.forEach(item => {{ mapaErrosPorNome[item.nome_arquivo] = item; }});
+
+            const badgeAnalise = document.getElementById("badgeStatusAnalise");
+            const barIa = document.getElementById("barProgressoIa");
+            if (ia.em_execucao) {{
+                badgeAnalise.textContent = `⚡ ANALISANDO AGORA (${{ia.percentual || 0}}%)`;
+                badgeAnalise.className = "badge badge-warn";
+                barIa.style.width = `${{Math.max(ia.percentual || 5, 5)}}%`;
+                barIa.className = "bar-fill bar-amber";
+            }} else if (arqComErro.length > 0) {{
+                badgeAnalise.textContent = `⚠️ ATENÇÃO: ${{arqComErro.length}} ARTIGO(S) COM ERRO`;
+                badgeAnalise.className = "badge badge-err";
+                barIa.style.width = `${{ia.percentual || 0}}%`;
+                barIa.className = "bar-fill bar-red";
+            }} else {{
+                badgeAnalise.textContent = sched.ativo
+                    ? `🟢 AGENDADOR ATIVO (Ciclo ${{sched.intervalo_minutos || 10}} min)`
+                    : "⏸️ AGENDADOR PAUSADO";
+                badgeAnalise.className = "badge badge-live";
+                barIa.style.width = `${{ia.percentual || 0}}%`;
+                barIa.className = "bar-fill bar-green";
+            }}
+
+            document.getElementById("txtProximoCiclo").textContent =
+                ia.em_execucao ? "Executando agora..." : (sched.proximo_ciclo_human || "--m --s");
+            document.getElementById("txtInfoScheduler").textContent =
+                `Ciclo a cada ${{sched.intervalo_minutos || 10}} min (máx. ${{sched.max_pdfs_por_ciclo || 3}} PDFs IA/ciclo)`;
+
+            const qtdFila = arqAguardando.length;
+            const maxCiclo = Math.max(sched.max_pdfs_por_ciclo || 3, 1);
+            const intMin = sched.intervalo_minutos || 10;
+            const ciclosEstimados = Math.ceil(qtdFila / maxCiclo);
+            const minEstimados = ciclosEstimados * intMin;
+            document.getElementById("txtFilaAguardandoQtd").textContent = `${{qtdFila}} artigo(s) PDF`;
+            document.getElementById("badgeFilaCount").textContent = `${{qtdFila}} na fila`;
+            document.getElementById("txtEstimativaTempo").textContent =
+                qtdFila === 0
+                    ? "Fila zerada — nenhum artigo pendente"
+                    : `Estimativa econômica: ~${{minEstimados}} min (${{ciclosEstimados}} ciclo(s) de ${{intMin}} min)`;
+
+            const elErrosQtd = document.getElementById("txtErrosAnaliseQtd");
+            const elErrosSub = document.getElementById("txtErrosAnaliseSub");
+            const btnLimparErros = document.getElementById("btnLimparErros");
+            elErrosQtd.textContent = `${{arqComErro.length}} artigo(s)`;
+            if (arqComErro.length > 0) {{
+                elErrosQtd.style.color = "#f87171";
+                elErrosSub.textContent = "Verifique a tabela de erros abaixo";
+                btnLimparErros.style.display = "inline-block";
+            }} else {{
+                elErrosQtd.style.color = "#34d399";
+                elErrosSub.textContent = "Nenhum artigo com erro registrado";
+                btnLimparErros.style.display = "none";
+            }}
+
+            document.getElementById("txtEconomiaIa").textContent =
+                `${{ia.economia_requisicoes_ia || 0}} req IA poupadas`;
+            document.getElementById("txtSuperbatchesSub").textContent =
+                `${{ia.superbatches_enviados || 0}} Super-Batch(es) enviado(s) | ${{ia.duplicados_bloqueados || 0}} duplicado(s)`;
+
+            document.getElementById("txtEtapaAnalise").textContent =
+                ia.etapa_atual || "Ocioso — aguardando próximo ciclo.";
+            document.getElementById("txtArquivoAnalise").textContent =
+                ia.arquivo_atual ? `[${{ia.arquivo_atual}}]` : "";
+            document.getElementById("txtUltimoResumoCron").textContent =
+                `${{sched.ultimo_resumo || "Aguardando primeiro ciclo"}} (Última checagem: ${{sched.ultimo_ciclo_em || "--"}})`;
+            document.getElementById("txtModeloAtivoIa").textContent =
+                `Modelo ativo: ${{ia.modelo_ativo || "gemini-3.5-flash-lite"}}`;
+
+            // Tabela de Artigos Aguardando Análise (novos_diarios/)
+            const tbodyAgu = document.getElementById("tbodyArtigosAguardando");
+            if (arqAguardando.length === 0) {{
+                tbodyAgu.innerHTML = `<tr><td colspan="4" style="color:#34d399; font-weight:600;">✅ Nenhum artigo aguardando análise em novos_diarios/.</td></tr>`;
+            }} else {{
+                tbodyAgu.innerHTML = arqAguardando.map((a, i) => {{
+                    const errInfo = mapaErrosPorNome[a.nome];
+                    const badgeSit = errInfo
+                        ? `<span class="badge badge-err" title="${{errInfo.erro}}">⚠️ Erro anterior (${{errInfo.tentativas}}x)</span>`
+                        : (i < maxCiclo
+                            ? `<span class="badge badge-live">🎯 Próximo lote (10 min)</span>`
+                            : `<span class="badge">⏳ Na fila (#${{i + 1}})</span>`);
+                    return `
+                        <tr>
+                            <td><code>${{a.nome}}</code></td>
+                            <td>${{a.tamanho_human}}</td>
+                            <td>${{a.modificado}}</td>
+                            <td>${{badgeSit}}</td>
+                        </tr>
+                    `;
+                }}).join("");
+            }}
+
+            // Tabela de Artigos que Tiveram Erro
+            const tbodyErr = document.getElementById("tbodyArtigosComErro");
+            if (arqComErro.length === 0) {{
+                tbodyErr.innerHTML = `<tr><td colspan="4" style="color:#34d399; font-weight:600;">✅ Nenhum artigo apresentou erro de análise.</td></tr>`;
+            }} else {{
+                tbodyErr.innerHTML = arqComErro.map(e => `
+                    <tr>
+                        <td><code>${{e.nome_arquivo}}</code></td>
+                        <td><span class="badge badge-err">${{e.tentativas}}x</span></td>
+                        <td>${{e.horario}}</td>
+                        <td style="color:#fca5a5; font-size:0.8rem;">${{e.erro}}</td>
+                    </tr>
+                `).join("");
+            }}
+
+            // Tabela de Cotas Gemini no Servidor
+            const tbodyCotasSrv = document.getElementById("tbodyCotasServidor");
+            if (ia.cotas_modelos && tbodyCotasSrv) {{
+                tbodyCotasSrv.innerHTML = ia.cotas_modelos.map((c, idx) => {{
+                    const stBadge = c.disponivel
+                        ? `<span class="badge badge-live">Disponível</span>`
+                        : `<span class="badge badge-warn">Cooldown (${{c.em_cooldown_seg}}s)</span>`;
+                    return `
+                        <tr>
+                            <td><strong>#${{idx + 1}}</strong></td>
+                            <td><code>${{c.model}}</code></td>
+                            <td><strong>${{c.rpm_usado}}</strong> / ${{c.rpm_limite}} RPM</td>
+                            <td>${{(c.tpm_limite / 1000)}}K TPM</td>
+                            <td><strong>${{c.rpd_usado}}</strong> / ${{c.rpd_limite}} RPD</td>
+                            <td>${{stBadge}}</td>
+                        </tr>
+                    `;
+                }}).join("");
+            }}
+        }}
+
+        async function limparErrosAnalise() {{
+            try {{
+                const resp = await fetch("/licitacoes/servidor/limpar-erros/", {{
+                    method: "POST",
+                    headers: {{
+                        "X-CSRFToken": "{csrf_token}",
+                        "X-Requested-With": "XMLHttpRequest"
+                    }}
+                }});
+                if (resp.ok) buscarMetricas(false);
+            }} catch (e) {{}}
         }}
 
         async function buscarMetricas(forcarStorage = false) {{

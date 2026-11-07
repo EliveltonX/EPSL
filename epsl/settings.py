@@ -417,4 +417,35 @@ GEMINI_FALLBACK_MODELS = [item["model"] for item in GEMINI_MODELS_QUOTAS]
 if GEMINI_MODEL not in GEMINI_FALLBACK_MODELS:
     GEMINI_FALLBACK_MODELS.insert(0, GEMINI_MODEL)
 
+# ==============================================================================
+# Estratégia Ultra-Econômica de RPD/RPM: Super-Batching (250K TPM) + Cron 10 min
+# ==============================================================================
+# Agrupa as páginas pré-filtradas de múltiplos PDFs em uma única chamada ao Gemini
+# aproveitando a janela de 250.000 TPM (~450.000 caracteres ≈ 112.000 tokens seguros).
+GEMINI_SUPERBATCH_MAX_CHARS = int(
+    os.getenv("GEMINI_SUPERBATCH_MAX_CHARS", "450000")
+)
+GEMINI_SUPERBATCH_MAX_FILES = int(
+    os.getenv("GEMINI_SUPERBATCH_MAX_FILES", "5")
+)
+# Pausa mínima obrigatória entre duas chamadas consecutivas à API Gemini (mantém RPM <= 3)
+GEMINI_MIN_INTERVAL_BETWEEN_CALLS_SEC = float(
+    os.getenv("GEMINI_MIN_INTERVAL_BETWEEN_CALLS_SEC", "20.0")
+)
+
+# Agendador em background (verifica novos_diarios/ a cada 10 minutos sem pressa)
+PIPELINE_CRON_ENABLED = os.getenv("PIPELINE_CRON_ENABLED", "True").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+PIPELINE_CRON_INTERVAL_MINUTES = int(
+    os.getenv("PIPELINE_CRON_INTERVAL_MINUTES", "10")
+)
+# Quantidade máxima de PDFs enviados à IA por ciclo automático de 10 minutos
+# (PDFs duplicados ou sem match no Regex são arquivados imediatamente sem gastar cota)
+PIPELINE_MAX_GEMINI_FILES_PER_CRON = int(
+    os.getenv("PIPELINE_MAX_GEMINI_FILES_PER_CRON", "3")
+)
+
 PIPELINE_TRIGGER_TOKEN = os.getenv("PIPELINE_TRIGGER_TOKEN", "")

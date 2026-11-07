@@ -6,3 +6,7 @@ class LicitacoesConfig(AppConfig):
     name = "licitacoes"
     verbose_name = "Licitações (Diários Oficiais)"
 
+    def ready(self) -> None:
+        from licitacoes.scheduler_worker import iniciar_agendador_se_habilitado
+
+        iniciar_agendador_se_habilitado()
