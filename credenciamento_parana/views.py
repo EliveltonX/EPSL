@@ -267,28 +267,40 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
         for nome_t in turnos_vistos_na_escola:
             contagem_turnos[nome_t] += 1
 
-    opcoes_cursos_html = '<option value="">🎓 Todos os Cursos (28 cursos)</option>'
+    opcoes_cursos_html = ""
     for curso_nome in sorted(contagem_cursos.keys()):
         qtd_esc = contagem_cursos[curso_nome]
         curso_esc = html.escape(curso_nome)
         opcoes_cursos_html += (
-            f'<option value="{curso_esc}">{curso_esc} ({qtd_esc} esc.)</option>'
+            f'<label class="ms-item" data-search="{curso_esc.lower()}">'
+            f'<input type="checkbox" name="ms-curso" value="{curso_esc}" onchange="aoMudarMultiSelect(\'cursos\')">'
+            f'<span class="ms-item-text">{curso_esc}</span>'
+            f'<span class="ms-item-count">{qtd_esc} esc.</span>'
+            f'</label>'
         )
 
-    opcoes_municipios_html = '<option value="">🏙️ Todos os Municípios (34 cidades)</option>'
+    opcoes_municipios_html = ""
     for mun_nome in sorted(contagem_municipios.keys()):
         qtd_esc = contagem_municipios[mun_nome]
         mun_esc = html.escape(mun_nome)
         opcoes_municipios_html += (
-            f'<option value="{mun_esc}">{mun_esc} ({qtd_esc} esc.)</option>'
+            f'<label class="ms-item" data-search="{mun_esc.lower()}">'
+            f'<input type="checkbox" name="ms-municipio" value="{mun_esc}" onchange="aoMudarMultiSelect(\'municipios\')">'
+            f'<span class="ms-item-text">{mun_esc}</span>'
+            f'<span class="ms-item-count">{qtd_esc} esc.</span>'
+            f'</label>'
         )
 
-    opcoes_nucleos_html = '<option value="">🏛️ Todos os Núcleos Regionais (25 NREs)</option>'
+    opcoes_nucleos_html = ""
     for nuc_nome in sorted(contagem_nucleos.keys()):
         qtd_esc = contagem_nucleos[nuc_nome]
         nuc_esc = html.escape(nuc_nome)
         opcoes_nucleos_html += (
-            f'<option value="{nuc_esc}">{nuc_esc} ({qtd_esc} esc.)</option>'
+            f'<label class="ms-item" data-search="{nuc_esc.lower()}">'
+            f'<input type="checkbox" name="ms-nucleo" value="{nuc_esc}" onchange="aoMudarMultiSelect(\'nucleos\')">'
+            f'<span class="ms-item-text">{nuc_esc}</span>'
+            f'<span class="ms-item-count">{qtd_esc} esc.</span>'
+            f'</label>'
         )
 
     escolas_json_str = json.dumps(escolas_data, ensure_ascii=False)
@@ -479,6 +491,185 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
         .filter-input:focus, .filter-select:focus {{
             border-color: var(--primary);
             box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
+        }}
+
+        /* Custom Multi-Select Dropdowns */
+        .ms-dropdown {{
+            position: relative;
+            width: 100%;
+        }}
+        .ms-trigger {{
+            width: 100%;
+            padding: 9px 12px;
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            font-size: 0.86rem;
+            background: #ffffff;
+            color: #0f172a;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            text-align: left;
+            transition: border-color 0.15s, box-shadow 0.15s;
+        }}
+        .ms-trigger:hover {{
+            border-color: #94a3b8;
+        }}
+        .ms-trigger.has-selection {{
+            border-color: var(--primary);
+            background: #eff6ff;
+            font-weight: 700;
+            color: #1e40af;
+        }}
+        .ms-trigger-text {{
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            flex: 1;
+        }}
+        .ms-count-badge {{
+            background: var(--primary);
+            color: #ffffff;
+            font-size: 0.72rem;
+            font-weight: 800;
+            padding: 2px 7px;
+            border-radius: 999px;
+            display: none;
+        }}
+        .ms-trigger.has-selection .ms-count-badge {{
+            display: inline-block;
+        }}
+        .ms-menu {{
+            display: none;
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 0;
+            right: 0;
+            min-width: 280px;
+            background: #ffffff;
+            border: 1px solid #cbd5e1;
+            border-radius: 10px;
+            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.18);
+            z-index: 1500;
+            padding: 8px;
+        }}
+        .ms-dropdown.open .ms-menu {{
+            display: block;
+        }}
+        .ms-search-box {{
+            width: 100%;
+            padding: 7px 10px;
+            border: 1px solid #cbd5e1;
+            border-radius: 6px;
+            font-size: 0.82rem;
+            margin-bottom: 6px;
+            outline: none;
+        }}
+        .ms-search-box:focus {{
+            border-color: var(--primary);
+        }}
+        .ms-actions {{
+            display: flex;
+            justify-content: space-between;
+            gap: 6px;
+            margin-bottom: 6px;
+            padding-bottom: 6px;
+            border-bottom: 1px solid #e2e8f0;
+        }}
+        .ms-action-btn {{
+            flex: 1;
+            padding: 4px 8px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            border-radius: 6px;
+            border: 1px solid #cbd5e1;
+            background: #f8fafc;
+            color: #334155;
+            cursor: pointer;
+        }}
+        .ms-action-btn:hover {{
+            background: #e2e8f0;
+        }}
+        .ms-list {{
+            max-height: 230px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }}
+        .ms-item {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 8px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.81rem;
+            font-weight: 500 !important;
+            color: #1e293b !important;
+            user-select: none;
+        }}
+        .ms-item:hover {{
+            background: #f1f5f9;
+        }}
+        .ms-item input[type="checkbox"] {{
+            width: 15px;
+            height: 15px;
+            accent-color: var(--primary);
+            cursor: pointer;
+            margin: 0;
+        }}
+        .ms-item-text {{
+            flex: 1;
+            line-height: 1.25;
+        }}
+        .ms-item-count {{
+            font-size: 0.72rem;
+            color: #64748b;
+            background: #f1f5f9;
+            padding: 1px 6px;
+            border-radius: 999px;
+            font-weight: 700;
+        }}
+
+        /* Active Selected Filter Pills */
+        .active-filters-bar {{
+            display: none;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 12px;
+            padding: 10px 12px;
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+            border-radius: 8px;
+            align-items: center;
+        }}
+        .active-filters-bar.visible {{
+            display: flex;
+        }}
+        .active-pill {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: #ffffff;
+            border: 1px solid #93c5fd;
+            color: #1e3a8a;
+            padding: 3px 9px;
+            border-radius: 999px;
+            font-size: 0.77rem;
+            font-weight: 700;
+        }}
+        .active-pill button {{
+            background: none;
+            border: none;
+            color: #dc2626;
+            font-weight: 800;
+            cursor: pointer;
+            padding: 0 2px;
+            font-size: 0.82rem;
+            line-height: 1;
         }}
 
         /* Quick Chips Bar */
@@ -913,60 +1104,155 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                        oninput="aplicarFiltros()">
             </div>
 
-            <!-- 4. Curso Técnico -->
+            <!-- 4. Curso Técnico (Multi-Select) -->
             <div class="filter-group">
-                <label for="f-curso">🎓 Filtrar por Curso Técnico</label>
-                <select id="f-curso" class="filter-select" onchange="aplicarFiltros()">
-                    {opcoes_cursos_html}
-                </select>
+                <label>🎓 Cursos Técnicos (Múltipla Escolha)</label>
+                <div class="ms-dropdown" id="ms-dropdown-cursos">
+                    <button type="button" class="ms-trigger" id="ms-trigger-cursos" onclick="alternarMenuMultiSelect('cursos', event)">
+                        <span class="ms-trigger-text" id="ms-label-cursos">Todos os Cursos (28)</span>
+                        <span class="ms-count-badge" id="ms-badge-cursos">0</span>
+                        <span>▾</span>
+                    </button>
+                    <div class="ms-menu" onclick="event.stopPropagation()">
+                        <input type="text" class="ms-search-box" placeholder="Filtrar cursos (ex: Gastronomia, Eletro)..."
+                               oninput="filtrarOpcoesMultiSelect('cursos', this.value)">
+                        <div class="ms-actions">
+                            <button type="button" class="ms-action-btn" onclick="marcarTodosMultiSelect('cursos', true)">✅ Marcar visíveis</button>
+                            <button type="button" class="ms-action-btn" onclick="marcarTodosMultiSelect('cursos', false)">🧹 Limpar cursos</button>
+                        </div>
+                        <div class="ms-list" id="ms-list-cursos">
+                            {opcoes_cursos_html}
+                        </div>
+                    </div>
+                </div>
             </div>
 
-            <!-- 5. Modalidade / Modelo (Integrado / Integral vs Subsequente) -->
+            <!-- 5. Modalidade / Modelo (Multi-Select) -->
             <div class="filter-group">
-                <label for="f-modalidade">📘 Modalidade (Integrado / Subsequente / Integral)</label>
-                <select id="f-modalidade" class="filter-select" onchange="aplicarFiltros()">
-                    <option value="">Todas as Modalidades</option>
-                    <option value="integrado">📘 Médio Integrado (Ensino Médio + Técnico)</option>
-                    <option value="subsequente">📙 Prof/Técnico (Subsequente - Pós-Médio)</option>
-                    <option value="integral_turno">⏱️ Regime em Tempo Integral (Turno Integral)</option>
-                    <option value="integrado_ou_integral">📘 Médio Integrado OU Turno Integral</option>
-                    <option value="ambas_modalidades">📗 Escolas com Ambas Modalidades (Integrado + Subsequente)</option>
-                </select>
+                <label>📘 Modalidades (Múltipla Escolha)</label>
+                <div class="ms-dropdown" id="ms-dropdown-modalidades">
+                    <button type="button" class="ms-trigger" id="ms-trigger-modalidades" onclick="alternarMenuMultiSelect('modalidades', event)">
+                        <span class="ms-trigger-text" id="ms-label-modalidades">Todas as Modalidades</span>
+                        <span class="ms-count-badge" id="ms-badge-modalidades">0</span>
+                        <span>▾</span>
+                    </button>
+                    <div class="ms-menu" onclick="event.stopPropagation()">
+                        <div class="ms-actions">
+                            <button type="button" class="ms-action-btn" onclick="marcarTodosMultiSelect('modalidades', true)">✅ Marcar todas</button>
+                            <button type="button" class="ms-action-btn" onclick="marcarTodosMultiSelect('modalidades', false)">🧹 Limpar</button>
+                        </div>
+                        <div class="ms-list" id="ms-list-modalidades">
+                            <label class="ms-item" data-search="medio integrado ensino medio tecnico">
+                                <input type="checkbox" name="ms-modalidade" value="integrado" onchange="aoMudarMultiSelect('modalidades')">
+                                <span class="ms-item-text">📘 Médio Integrado</span>
+                            </label>
+                            <label class="ms-item" data-search="subsequente prof tecnico pos medio">
+                                <input type="checkbox" name="ms-modalidade" value="subsequente" onchange="aoMudarMultiSelect('modalidades')">
+                                <span class="ms-item-text">📙 Prof/Técnico (Subsequente)</span>
+                            </label>
+                            <label class="ms-item" data-search="integral tempo integral">
+                                <input type="checkbox" name="ms-modalidade" value="integral_turno" onchange="aoMudarMultiSelect('modalidades')">
+                                <span class="ms-item-text">⏱️ Regime em Tempo Integral</span>
+                            </label>
+                            <label class="ms-item" data-search="ambas integrado e subsequente">
+                                <input type="checkbox" name="ms-modalidade" value="ambas_modalidades" onchange="aoMudarMultiSelect('modalidades')">
+                                <span class="ms-item-text">📗 Escolas com Ambas (Integrado + Subseq.)</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
             </div>
 
-            <!-- 6. Turno -->
+            <!-- 6. Turno (Multi-Select) -->
             <div class="filter-group">
-                <label for="f-turno">🕒 Filtrar por Turno de Oferta</label>
-                <select id="f-turno" class="filter-select" onchange="aplicarFiltros()">
-                    <option value="">Todos os Turnos (Manhã, Tarde, Noite, Integral)</option>
-                    <option value="Manhã">🌅 Manhã</option>
-                    <option value="Tarde">☀️ Tarde</option>
-                    <option value="Noite">🌙 Noite</option>
-                    <option value="Integral">⏱️ Integral</option>
-                </select>
+                <label>🕒 Turnos de Oferta (Múltipla Escolha)</label>
+                <div class="ms-dropdown" id="ms-dropdown-turnos">
+                    <button type="button" class="ms-trigger" id="ms-trigger-turnos" onclick="alternarMenuMultiSelect('turnos', event)">
+                        <span class="ms-trigger-text" id="ms-label-turnos">Todos os Turnos</span>
+                        <span class="ms-count-badge" id="ms-badge-turnos">0</span>
+                        <span>▾</span>
+                    </button>
+                    <div class="ms-menu" onclick="event.stopPropagation()">
+                        <div class="ms-actions">
+                            <button type="button" class="ms-action-btn" onclick="marcarTodosMultiSelect('turnos', true)">✅ Marcar todos</button>
+                            <button type="button" class="ms-action-btn" onclick="marcarTodosMultiSelect('turnos', false)">🧹 Limpar</button>
+                        </div>
+                        <div class="ms-list" id="ms-list-turnos">
+                            <label class="ms-item" data-search="manha">
+                                <input type="checkbox" name="ms-turno" value="Manhã" onchange="aoMudarMultiSelect('turnos')">
+                                <span class="ms-item-text">🌅 Manhã</span>
+                            </label>
+                            <label class="ms-item" data-search="tarde">
+                                <input type="checkbox" name="ms-turno" value="Tarde" onchange="aoMudarMultiSelect('turnos')">
+                                <span class="ms-item-text">☀️ Tarde</span>
+                            </label>
+                            <label class="ms-item" data-search="noite">
+                                <input type="checkbox" name="ms-turno" value="Noite" onchange="aoMudarMultiSelect('turnos')">
+                                <span class="ms-item-text">🌙 Noite</span>
+                            </label>
+                            <label class="ms-item" data-search="integral">
+                                <input type="checkbox" name="ms-turno" value="Integral" onchange="aoMudarMultiSelect('turnos')">
+                                <span class="ms-item-text">⏱️ Integral</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
             </div>
 
-            <!-- 7. Município -->
+            <!-- 7. Município (Multi-Select) -->
             <div class="filter-group">
-                <label for="f-municipio">🏙️ Filtrar por Município</label>
-                <select id="f-municipio" class="filter-select" onchange="aplicarFiltros()">
-                    {opcoes_municipios_html}
-                </select>
+                <label>🏙️ Municípios (Múltipla Escolha)</label>
+                <div class="ms-dropdown" id="ms-dropdown-municipios">
+                    <button type="button" class="ms-trigger" id="ms-trigger-municipios" onclick="alternarMenuMultiSelect('municipios', event)">
+                        <span class="ms-trigger-text" id="ms-label-municipios">Todos os Municípios (34)</span>
+                        <span class="ms-count-badge" id="ms-badge-municipios">0</span>
+                        <span>▾</span>
+                    </button>
+                    <div class="ms-menu" onclick="event.stopPropagation()">
+                        <input type="text" class="ms-search-box" placeholder="Filtrar cidades (ex: Curitiba, Londrina)..."
+                               oninput="filtrarOpcoesMultiSelect('municipios', this.value)">
+                        <div class="ms-actions">
+                            <button type="button" class="ms-action-btn" onclick="marcarTodosMultiSelect('municipios', true)">✅ Marcar visíveis</button>
+                            <button type="button" class="ms-action-btn" onclick="marcarTodosMultiSelect('municipios', false)">🧹 Limpar cidades</button>
+                        </div>
+                        <div class="ms-list" id="ms-list-municipios">
+                            {opcoes_municipios_html}
+                        </div>
+                    </div>
+                </div>
             </div>
 
-            <!-- 8. Núcleo Regional de Educação -->
+            <!-- 8. Núcleo Regional de Educação (Multi-Select) -->
             <div class="filter-group">
-                <label for="f-nucleo">🏛️ Núcleo Regional de Educação (NRE)</label>
-                <select id="f-nucleo" class="filter-select" onchange="aplicarFiltros()">
-                    {opcoes_nucleos_html}
-                </select>
+                <label>🏛️ Núcleos Regionais - NRE (Múltipla Escolha)</label>
+                <div class="ms-dropdown" id="ms-dropdown-nucleos">
+                    <button type="button" class="ms-trigger" id="ms-trigger-nucleos" onclick="alternarMenuMultiSelect('nucleos', event)">
+                        <span class="ms-trigger-text" id="ms-label-nucleos">Todos os NREs (25)</span>
+                        <span class="ms-count-badge" id="ms-badge-nucleos">0</span>
+                        <span>▾</span>
+                    </button>
+                    <div class="ms-menu" onclick="event.stopPropagation()">
+                        <input type="text" class="ms-search-box" placeholder="Filtrar NRE..."
+                               oninput="filtrarOpcoesMultiSelect('nucleos', this.value)">
+                        <div class="ms-actions">
+                            <button type="button" class="ms-action-btn" onclick="marcarTodosMultiSelect('nucleos', true)">✅ Marcar visíveis</button>
+                            <button type="button" class="ms-action-btn" onclick="marcarTodosMultiSelect('nucleos', false)">🧹 Limpar NREs</button>
+                        </div>
+                        <div class="ms-list" id="ms-list-nucleos">
+                            {opcoes_nucleos_html}
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
 
-        <!-- Atalhos Rápidos de Cursos do Nicho TI / Tecnologia -->
+        <!-- Barra de Pílulas dos Filtros Ativos -->
+        <div class="active-filters-bar" id="active-filters-bar"></div>
+
+        <!-- Atalhos Rápidos de Cursos (Clique para Somar/Alternar Múltiplos Cursos) -->
         <div class="quick-chips">
-            <span style="font-size:0.78rem; font-weight:700; color:#475569;">⚡ Atalhos Rápidos de Cursos:</span>
-            <button type="button" class="chip-btn" onclick="selecionarChipCurso('')">Todos (147)</button>
+            <span style="font-size:0.78rem; font-weight:700; color:#475569;">⚡ Atalhos Rápidos (clique em vários para combinar):</span>
+            <button type="button" class="chip-btn active" onclick="selecionarChipCurso('')">Todos (147)</button>
             <button type="button" class="chip-btn" onclick="selecionarChipCurso('DESENVOLVIMENTO DE SISTEMAS')">💻 Desenvolvimento de Sistemas</button>
             <button type="button" class="chip-btn" onclick="selecionarChipCurso('INTELIGÊNCIA ARTIFICIAL')">🤖 Inteligência Artificial</button>
             <button type="button" class="chip-btn" onclick="selecionarChipCurso('AUTOMAÇÃO INDUSTRIAL')">⚙️ Automação Industrial</button>
@@ -1110,27 +1396,139 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             }});
         }}
 
+        const MS_CONFIG = {{
+            cursos: {{ inputName: "ms-curso", defaultLabel: "Todos os Cursos (28)", icon: "🎓" }},
+            modalidades: {{ inputName: "ms-modalidade", defaultLabel: "Todas as Modalidades", icon: "📘" }},
+            turnos: {{ inputName: "ms-turno", defaultLabel: "Todos os Turnos", icon: "🕒" }},
+            municipios: {{ inputName: "ms-municipio", defaultLabel: "Todos os Municípios (34)", icon: "🏙️" }},
+            nucleos: {{ inputName: "ms-nucleo", defaultLabel: "Todos os NREs (25)", icon: "🏛️" }}
+        }};
+
+        const MODALIDADE_LABELS = {{
+            "integrado": "Médio Integrado",
+            "subsequente": "Prof/Técnico (Subsequente)",
+            "integral_turno": "Regime Integral",
+            "ambas_modalidades": "Ambas Modalidades"
+        }};
+
+        function obterValoresMarcados(groupKey) {{
+            const cfg = MS_CONFIG[groupKey];
+            if (!cfg) return [];
+            const checkboxes = document.querySelectorAll(`input[name="${{cfg.inputName}}"]:checked`);
+            return Array.from(checkboxes).map(cb => cb.value);
+        }}
+
+        function alternarMenuMultiSelect(groupKey, event) {{
+            if (event) event.stopPropagation();
+            const targetDropdown = document.getElementById(`ms-dropdown-${{groupKey}}`);
+            const wasOpen = targetDropdown.classList.contains("open");
+            document.querySelectorAll(".ms-dropdown.open").forEach(el => el.classList.remove("open"));
+            if (!wasOpen) {{
+                targetDropdown.classList.add("open");
+                const searchInput = targetDropdown.querySelector(".ms-search-box");
+                if (searchInput) {{
+                    setTimeout(() => searchInput.focus(), 30);
+                }}
+            }}
+        }}
+
+        document.addEventListener("click", () => {{
+            document.querySelectorAll(".ms-dropdown.open").forEach(el => el.classList.remove("open"));
+        }});
+
+        function filtrarOpcoesMultiSelect(groupKey, termo) {{
+            const q = normalizarTexto(termo);
+            const listEl = document.getElementById(`ms-list-${{groupKey}}`);
+            if (!listEl) return;
+            listEl.querySelectorAll(".ms-item").forEach(labelEl => {{
+                const alvo = normalizarTexto(labelEl.getAttribute("data-search") || labelEl.textContent);
+                labelEl.style.display = (!q || alvo.includes(q)) ? "flex" : "none";
+            }});
+        }}
+
+        function marcarTodosMultiSelect(groupKey, marcar) {{
+            const listEl = document.getElementById(`ms-list-${{groupKey}}`);
+            if (!listEl) return;
+            listEl.querySelectorAll(".ms-item").forEach(labelEl => {{
+                if (marcar && labelEl.style.display === "none") return;
+                const cb = labelEl.querySelector('input[type="checkbox"]');
+                if (cb) cb.checked = marcar;
+            }});
+            aoMudarMultiSelect(groupKey);
+        }}
+
+        function atualizarRotuloMultiSelect(groupKey) {{
+            const cfg = MS_CONFIG[groupKey];
+            const selecionados = obterValoresMarcados(groupKey);
+            const trigger = document.getElementById(`ms-trigger-${{groupKey}}`);
+            const labelEl = document.getElementById(`ms-label-${{groupKey}}`);
+            const badgeEl = document.getElementById(`ms-badge-${{groupKey}}`);
+
+            if (selecionados.length === 0) {{
+                trigger.classList.remove("has-selection");
+                labelEl.textContent = cfg.defaultLabel;
+                badgeEl.textContent = "0";
+            }} else {{
+                trigger.classList.add("has-selection");
+                badgeEl.textContent = String(selecionados.length);
+                if (selecionados.length === 1) {{
+                    const val = selecionados[0];
+                    labelEl.textContent = groupKey === "modalidades" ? (MODALIDADE_LABELS[val] || val) : val;
+                }} else {{
+                    const nomes = selecionados.map(v => groupKey === "modalidades" ? (MODALIDADE_LABELS[v] || v) : v);
+                    labelEl.textContent = `${{nomes.slice(0, 2).join(", ")}}${{nomes.length > 2 ? " +" + (nomes.length - 2) : ""}}`;
+                }}
+            }}
+        }}
+
+        function aoMudarMultiSelect(groupKey) {{
+            atualizarRotuloMultiSelect(groupKey);
+            aplicarFiltros();
+        }}
+
+        function removerItemMultiSelect(groupKey, valor) {{
+            const cfg = MS_CONFIG[groupKey];
+            if (!cfg) return;
+            const checkboxes = document.querySelectorAll(`input[name="${{cfg.inputName}}"]`);
+            checkboxes.forEach(cb => {{
+                if (cb.value === valor) cb.checked = false;
+            }});
+            aoMudarMultiSelect(groupKey);
+        }}
+
+        function temFiltroCursoOuTurnoOuModalidade(filtros) {{
+            const modPorCurso = filtros.modalidades.filter(m => m !== "ambas_modalidades");
+            return Boolean(
+                filtros.cursos.length > 0 ||
+                filtros.turnos.length > 0 ||
+                modPorCurso.length > 0
+            );
+        }}
+
         function cursoPassaFiltroIndividual(curso, filtros) {{
-            if (filtros.curso && curso.nome_curso !== filtros.curso) {{
+            if (filtros.cursos.length > 0 && !filtros.cursos.includes(curso.nome_curso)) {{
                 return false;
             }}
-            if (filtros.turno && curso.turno !== filtros.turno) {{
+            if (filtros.turnos.length > 0 && !filtros.turnos.includes(curso.turno)) {{
                 return false;
             }}
-            if (filtros.modalidade === "integrado" && curso.tipo_modalidade !== "integrado") {{
-                return false;
-            }}
-            if (filtros.modalidade === "subsequente" && curso.tipo_modalidade !== "subsequente") {{
-                return false;
-            }}
-            if (filtros.modalidade === "integral_turno" && curso.turno !== "Integral") {{
-                return false;
-            }}
-            if (filtros.modalidade === "integrado_ou_integral" && !(curso.tipo_modalidade === "integrado" || curso.turno === "Integral")) {{
-                return false;
+            const modPorCurso = filtros.modalidades.filter(m => m !== "ambas_modalidades");
+            if (modPorCurso.length > 0) {{
+                let bateAlgumaModalidade = false;
+                if (modPorCurso.includes("integrado") && curso.tipo_modalidade === "integrado") {{
+                    bateAlgumaModalidade = true;
+                }}
+                if (modPorCurso.includes("subsequente") && curso.tipo_modalidade === "subsequente") {{
+                    bateAlgumaModalidade = true;
+                }}
+                if (modPorCurso.includes("integral_turno") && curso.turno === "Integral") {{
+                    bateAlgumaModalidade = true;
+                }}
+                if (!bateAlgumaModalidade) {{
+                    return false;
+                }}
             }}
             if (filtros.buscaGeral) {{
-                // Se a busca geral bateu no nome do curso, destaca
                 const textoCurso = normalizarTexto(`${{curso.nome_curso}} ${{curso.modalidade}} ${{curso.turno}}`);
                 if (textoCurso.includes(filtros.buscaGeral)) {{
                     return true;
@@ -1142,10 +1540,10 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
         function montarHtmlPopup(escola, filtrosAtivos) {{
             const gmapsUrl = `https://www.google.com/maps/search/?api=1&query=${{encodeURIComponent(escola.endereco + ", " + escola.municipio + " - PR")}}`;
             let cursosHtml = "";
+            const destacarCursos = filtrosAtivos ? temFiltroCursoOuTurnoOuModalidade(filtrosAtivos) : false;
+
             for (const c of escola.cursos) {{
-                const isMatch = filtrosAtivos && (filtrosAtivos.curso || filtrosAtivos.turno || filtrosAtivos.modalidade)
-                    ? cursoPassaFiltroIndividual(c, filtrosAtivos)
-                    : false;
+                const isMatch = destacarCursos ? cursoPassaFiltroIndividual(c, filtrosAtivos) : false;
                 const badgeMod = c.tipo_modalidade === "subsequente"
                     ? `<span class="badge badge-subsequente">Subsequente</span>`
                     : `<span class="badge badge-integrado">Médio Integrado</span>`;
@@ -1262,23 +1660,54 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                 buscaGeral: normalizarTexto(document.getElementById("f-busca-geral").value),
                 escola: normalizarTexto(document.getElementById("f-escola").value),
                 endereco: normalizarTexto(document.getElementById("f-endereco").value),
-                curso: document.getElementById("f-curso").value,
-                modalidade: document.getElementById("f-modalidade").value,
-                turno: document.getElementById("f-turno").value,
-                municipio: document.getElementById("f-municipio").value,
-                nucleo: document.getElementById("f-nucleo").value,
+                cursos: obterValoresMarcados("cursos"),
+                modalidades: obterValoresMarcados("modalidades"),
+                turnos: obterValoresMarcados("turnos"),
+                municipios: obterValoresMarcados("municipios"),
+                nucleos: obterValoresMarcados("nucleos"),
                 apenasFavoritos: filtroApenasFavoritos
             }};
+        }}
+
+        function renderizarPilulasFiltrosAtivos(filtros) {{
+            const bar = document.getElementById("active-filters-bar");
+            if (!bar) return;
+            const pills = [];
+
+            for (const c of filtros.cursos) {{
+                pills.push(`<span class="active-pill">🎓 ${{escaparHtml(c)}} <button type="button" title="Remover" onclick="removerItemMultiSelect('cursos', '${{escaparHtml(c)}}')">✖</button></span>`);
+            }}
+            for (const m of filtros.modalidades) {{
+                const lbl = MODALIDADE_LABELS[m] || m;
+                pills.push(`<span class="active-pill">📘 ${{escaparHtml(lbl)}} <button type="button" title="Remover" onclick="removerItemMultiSelect('modalidades', '${{escaparHtml(m)}}')">✖</button></span>`);
+            }}
+            for (const t of filtros.turnos) {{
+                pills.push(`<span class="active-pill">🕒 ${{escaparHtml(t)}} <button type="button" title="Remover" onclick="removerItemMultiSelect('turnos', '${{escaparHtml(t)}}')">✖</button></span>`);
+            }}
+            for (const mun of filtros.municipios) {{
+                pills.push(`<span class="active-pill">🏙️ ${{escaparHtml(mun)}} <button type="button" title="Remover" onclick="removerItemMultiSelect('municipios', '${{escaparHtml(mun)}}')">✖</button></span>`);
+            }}
+            for (const nuc of filtros.nucleos) {{
+                pills.push(`<span class="active-pill">🏛️ ${{escaparHtml(nuc)}} <button type="button" title="Remover" onclick="removerItemMultiSelect('nucleos', '${{escaparHtml(nuc)}}')">✖</button></span>`);
+            }}
+
+            if (pills.length === 0) {{
+                bar.classList.remove("visible");
+                bar.innerHTML = "";
+            }} else {{
+                bar.classList.add("visible");
+                bar.innerHTML = `<span style="font-size:0.78rem; font-weight:800; color:#1e40af; margin-right:4px;">Filtros Selecionados (${{pills.length}}):</span>` + pills.join("");
+            }}
         }}
 
         function escolaPassaNosFiltros(escola, filtros) {{
             if (filtros.apenasFavoritos && !escola.favorito) {{
                 return false;
             }}
-            if (filtros.municipio && escola.municipio !== filtros.municipio) {{
+            if (filtros.municipios.length > 0 && !filtros.municipios.includes(escola.municipio)) {{
                 return false;
             }}
-            if (filtros.nucleo && escola.nucleo_regional !== filtros.nucleo) {{
+            if (filtros.nucleos.length > 0 && !filtros.nucleos.includes(escola.nucleo_regional)) {{
                 return false;
             }}
             if (filtros.escola) {{
@@ -1293,21 +1722,20 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                     return false;
                 }}
             }}
-            if (filtros.modalidade === "ambas_modalidades") {{
+
+            // Se marcou exclusivamente "ambas_modalidades", exige que a escola tenha Integrado E Subsequente
+            const modPorCurso = filtros.modalidades.filter(m => m !== "ambas_modalidades");
+            if (filtros.modalidades.includes("ambas_modalidades") && modPorCurso.length === 0) {{
                 if (!(escola.tem_integrado && escola.tem_subsequente)) {{
                     return false;
                 }}
             }}
 
             // Verifica se pelo menos 1 oferta de curso da escola satisfaz os filtros de curso/modalidade/turno combinados
-            const temFiltroDeCurso = Boolean(
-                filtros.curso ||
-                filtros.turno ||
-                (filtros.modalidade && filtros.modalidade !== "ambas_modalidades")
-            );
-            if (temFiltroDeCurso) {{
+            if (temFiltroCursoOuTurnoOuModalidade(filtros)) {{
                 const algumCursoBate = escola.cursos.some(c => cursoPassaFiltroIndividual(c, filtros));
-                if (!algumCursoBate) {{
+                const bateAmbas = filtros.modalidades.includes("ambas_modalidades") && escola.tem_integrado && escola.tem_subsequente;
+                if (!algumCursoBate && !bateAmbas) {{
                     return false;
                 }}
             }}
@@ -1317,7 +1745,6 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                 const textoCompleto = normalizarTexto(
                     `${{escola.item_edital}} ${{escola.nome_escola}} ${{escola.codigo_mec}} ${{escola.municipio}} ${{escola.nucleo_regional}} ${{escola.endereco}} ${{escola.cep}} ${{escola.responsavel}} ${{escola.email}} ${{nomesCursos}}`
                 );
-                // Permite buscar múltiplos termos separados por espaço
                 const termos = filtros.buscaGeral.split(/\\s+/).filter(Boolean);
                 for (const termo of termos) {{
                     if (!textoCompleto.includes(termo)) {{
@@ -1336,7 +1763,8 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             atualizarMarcadoresNoMapa(escolasFiltradasAtuais, filtros, isInitialLoad);
             atualizarTabelaAbaixoDoMapa(escolasFiltradasAtuais, filtros);
             atualizarKPIsEFavoritos(escolasFiltradasAtuais, filtros);
-            atualizarChipsAtivos(filtros.curso);
+            atualizarChipsAtivos(filtros.cursos);
+            renderizarPilulasFiltrosAtivos(filtros);
         }}
 
         function atualizarMarcadoresNoMapa(escolasVisiveis, filtros, isInitialLoad) {{
@@ -1387,7 +1815,7 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             let turmasVisiveis = 0;
             let chTotalVisivel = 0;
 
-            const temFiltroCurso = Boolean(filtros.curso || filtros.turno || (filtros.modalidade && filtros.modalidade !== "ambas_modalidades"));
+            const temFiltroCurso = temFiltroCursoOuTurnoOuModalidade(filtros);
 
             for (const esc of escolasVisiveis) {{
                 for (const c of esc.cursos) {{
@@ -1478,7 +1906,7 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                 return;
             }}
 
-            const temFiltroCurso = Boolean(filtros.curso || filtros.turno || (filtros.modalidade && filtros.modalidade !== "ambas_modalidades"));
+            const temFiltroCurso = temFiltroCursoOuTurnoOuModalidade(filtros);
 
             let rowsHtml = "";
             for (const esc of escolasVisiveis) {{
@@ -1649,21 +2077,35 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
         }}
 
         function selecionarChipCurso(nomeCurso) {{
-            const sel = document.getElementById("f-curso");
-            sel.value = nomeCurso;
-            aplicarFiltros();
+            const checkboxes = document.querySelectorAll('input[name="ms-curso"]');
+            if (!nomeCurso) {{
+                checkboxes.forEach(cb => cb.checked = false);
+            }} else {{
+                checkboxes.forEach(cb => {{
+                    if (cb.value === nomeCurso) {{
+                        cb.checked = !cb.checked;
+                    }}
+                }});
+            }}
+            aoMudarMultiSelect("cursos");
         }}
 
-        function atualizarChipsAtivos(cursoAtual) {{
+        function atualizarChipsAtivos(cursosSelecionados) {{
             const chips = document.querySelectorAll(".quick-chips .chip-btn");
             chips.forEach(btn => {{
                 const onclickAttr = btn.getAttribute("onclick") || "";
-                if (cursoAtual === "" && onclickAttr.includes("''")) {{
-                    btn.classList.add("active");
-                }} else if (cursoAtual && onclickAttr.includes(`'${{cursoAtual}}'`)) {{
+                if (cursosSelecionados.length === 0 && onclickAttr.includes("''")) {{
                     btn.classList.add("active");
                 }} else {{
-                    btn.classList.remove("active");
+                    let ativo = false;
+                    for (const c of cursosSelecionados) {{
+                        if (onclickAttr.includes(`'${{c}}'`)) {{
+                            ativo = true;
+                            break;
+                        }}
+                    }}
+                    if (ativo) btn.classList.add("active");
+                    else btn.classList.remove("active");
                 }}
             }});
         }}
@@ -1672,11 +2114,18 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             document.getElementById("f-busca-geral").value = "";
             document.getElementById("f-escola").value = "";
             document.getElementById("f-endereco").value = "";
-            document.getElementById("f-curso").value = "";
-            document.getElementById("f-modalidade").value = "";
-            document.getElementById("f-turno").value = "";
-            document.getElementById("f-municipio").value = "";
-            document.getElementById("f-nucleo").value = "";
+            Object.keys(MS_CONFIG).forEach(groupKey => {{
+                const cfg = MS_CONFIG[groupKey];
+                document.querySelectorAll(`input[name="${{cfg.inputName}}"]`).forEach(cb => cb.checked = false);
+                const listEl = document.getElementById(`ms-list-${{groupKey}}`);
+                if (listEl) listEl.querySelectorAll(".ms-item").forEach(el => el.style.display = "flex");
+                const dropEl = document.getElementById(`ms-dropdown-${{groupKey}}`);
+                if (dropEl) {{
+                    const s = dropEl.querySelector(".ms-search-box");
+                    if (s) s.value = "";
+                }}
+                atualizarRotuloMultiSelect(groupKey);
+            }});
             filtroApenasFavoritos = false;
             aplicarFiltros(true);
             visaoGeralParana();
@@ -1695,7 +2144,7 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             ];
             const linhas = [cabecalho.join(";")];
             const filtros = obterFiltrosAtivos();
-            const temFiltroCurso = Boolean(filtros.curso || filtros.turno || (filtros.modalidade && filtros.modalidade !== "ambas_modalidades"));
+            const temFiltroCurso = temFiltroCursoOuTurnoOuModalidade(filtros);
 
             for (const esc of escolasFiltradasAtuais) {{
                 for (const c of esc.cursos) {{
