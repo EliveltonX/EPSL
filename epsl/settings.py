@@ -69,6 +69,9 @@ for _extra_origin in os.getenv("CSRF_TRUSTED_ORIGINS", "").split(","):
 CSRF_TRUSTED_ORIGINS = sorted(set(_trusted_origins))
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 USE_X_FORWARDED_HOST = True
+# Necessário para que servidores de tiles do OpenStreetMap recebam o header Referer
+# (o padrão "same-origin" do Django omite o Referer e causa bloqueio http://osm.wiki/Blocked)
+SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
 
 INSTALLED_APPS = [
     "django.contrib.admin",

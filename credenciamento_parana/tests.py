@@ -45,3 +45,11 @@ class CredenciamentoParanaTests(TestCase):
         escola.refresh_from_db()
         self.assertTrue(escola.favorito)
 
+    def test_proxy_tile_osm_retorna_png_valido(self):
+        resp_tile = self.client.get("/credenciamento/tiles/osm/7/45/73.png")
+        self.assertEqual(resp_tile.status_code, 200)
+        self.assertEqual(resp_tile["Content-Type"], "image/png")
+        self.assertNotIn(len(resp_tile.content), (6672, 6725))
+        self.assertGreater(len(resp_tile.content), 1000)
+
+

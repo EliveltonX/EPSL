@@ -1,9 +1,11 @@
 import html
 import json
+import urllib.request
 from collections import Counter
+from pathlib import Path
 
 from django.contrib.auth.decorators import login_required
-from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.middleware.csrf import get_token
 from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import ensure_csrf_cookie
@@ -158,6 +160,82 @@ def resincronizar_dados_anexo1(request: HttpRequest) -> JsonResponse:
     return JsonResponse({"ok": True, **info})
 
 
+_TILE_CACHE_DIR = Path("/tmp/epsl_osm_tiles_cache")
+_OSM_HEADERS = {
+    "User-Agent": "EPSL-SEED-PR-Credenciamento/1.0 (+https://epsl.eliveltonpardini.com.br; contato@eliveltonpardini.com.br)",
+    "Referer": "https://epsl.eliveltonpardini.com.br/credenciamento/",
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
+
+
+@login_required
+@require_GET
+def servir_tile_mapa(
+    request: HttpRequest, provider: str, z: int, x: int, y: int
+) -> HttpResponse:
+    """
+    Proxy e Cache local em disco para tiles do OpenStreetMap (`osm`, `osm_de`, `esri_street`).
+    Evita o erro 'Access blocked: app is not following the tile usage policy' causado quando
+    o navegador omite o header Referer (`Referrer-Policy: same-origin` ou bloqueadores) e
+    reduz drasticamente requisições repetidas aos servidores comunitários do OSM.
+    """
+    if z < 0 or z > 20 or x < 0 or y < 0:
+        raise Http404("Coordenada de tile inválida.")
+
+    provider_clean = (provider or "osm").strip().lower()
+    if provider_clean not in ("osm", "osm_de", "esri_street"):
+        provider_clean = "osm"
+
+    cache_file = _TILE_CACHE_DIR / provider_clean / str(z) / f"{x}_{y}.png"
+    if cache_file.exists():
+        try:
+            tile_bytes = cache_file.read_bytes()
+            # A imagem "Access blocked" do OSM tem 6672 ou 6725 bytes; nunca servimos ela do cache
+            if len(tile_bytes) not in (6672, 6725) and len(tile_bytes) > 100:
+                resp = HttpResponse(tile_bytes, content_type="image/png")
+                resp["Cache-Control"] = "public, max-age=604800, immutable"
+                return resp
+        except Exception:
+            pass
+
+    urls_tentativa = []
+    if provider_clean == "osm":
+        urls_tentativa = [
+            f"https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            f"https://tile.openstreetmap.de/{z}/{x}/{y}.png",
+            f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+        ]
+    elif provider_clean == "osm_de":
+        urls_tentativa = [
+            f"https://tile.openstreetmap.de/{z}/{x}/{y}.png",
+            f"https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        ]
+    else:
+        urls_tentativa = [
+            f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+            f"https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        ]
+
+    for url in urls_tentativa:
+        try:
+            req = urllib.request.Request(url, headers=_OSM_HEADERS)
+            with urllib.request.urlopen(req, timeout=6) as upstream:
+                data = upstream.read()
+                if data and len(data) not in (6672, 6725):
+                    try:
+                        cache_file.parent.mkdir(parents=True, exist_ok=True)
+                        cache_file.write_bytes(data)
+                    except Exception:
+                        pass
+                    resp = HttpResponse(data, content_type="image/png")
+                    resp["Cache-Control"] = "public, max-age=604800, immutable"
+                    return resp
+        except Exception:
+            continue
+
+    raise Http404("Tile indisponível no momento.")
+
+
 @login_required
 @ensure_csrf_cookie
 @require_GET
@@ -220,6 +298,7 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="referrer" content="origin-when-cross-origin">
     <title>Mapa de Credenciamento SEED/PR (147 Escolas) — EPSL</title>
     <!-- Leaflet 1.9.4 CSS -->
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
@@ -1144,17 +1223,17 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
         }}
 
         function inicializarMapa() {{
-            const osmLayer = L.tileLayer("https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
+            const osmLayer = L.tileLayer("/credenciamento/tiles/osm/{{z}}/{{x}}/{{y}}.png", {{
                 maxZoom: 19,
                 attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
             }});
-            const osmHotLayer = L.tileLayer("https://{{s}}.tile.openstreetmap.fr/hot/{{z}}/{{x}}/{{y}}.png", {{
+            const osmDeLayer = L.tileLayer("/credenciamento/tiles/osm_de/{{z}}/{{x}}/{{y}}.png", {{
                 maxZoom: 19,
-                attribution: '&copy; OpenStreetMap contributors, Tiles style by <a href="https://www.hotosm.org/" target="_blank">HOT</a>'
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> DE'
             }});
-            const openTopoLayer = L.tileLayer("https://{{s}}.tile.opentopomap.org/{{z}}/{{x}}/{{y}}.png", {{
-                maxZoom: 17,
-                attribution: 'Map data: &copy; OpenStreetMap contributors, SRTM | Map style: &copy; <a href="https://opentopomap.org">OpenTopoMap</a> (CC-BY-SA)'
+            const esriStreetLayer = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{{z}}/{{y}}/{{x}}", {{
+                maxZoom: 19,
+                attribution: 'Tiles &copy; Esri — OpenStreetMap, HERE, Garmin'
             }});
             const esriSat = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}", {{
                 maxZoom: 19,
@@ -1168,9 +1247,9 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             }});
 
             L.control.layers({{
-                "🛣️ OpenStreetMap Oficial (Padrão Free)": osmLayer,
-                "🏥 OpenStreetMap Humanitarian (HOT)": osmHotLayer,
-                "⛰️ OpenTopoMap (Relevo e Rodovias)": openTopoLayer,
+                "🛣️ OpenStreetMap Oficial (Cache Local Anti-Bloqueio)": osmLayer,
+                "🗺️ OpenStreetMap Alternativo (OSM DE)": osmDeLayer,
+                "🏙️ Mapa de Ruas Nítido (Esri Street Map)": esriStreetLayer,
                 "🛰️ Satélite (Esri World Imagery)": esriSat
             }}, null, {{ position: "topright" }}).addTo(map);
 
@@ -1663,5 +1742,7 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
     </script>
 </body>
 </html>"""
-    return HttpResponse(pagina_html)
+    resp = HttpResponse(pagina_html)
+    resp["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return resp
 
