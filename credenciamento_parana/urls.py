@@ -27,3 +27,4 @@ urlpatterns = [
         name="resincronizar_dados_anexo1",
     ),
 ]
+

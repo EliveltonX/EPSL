@@ -44,3 +44,4 @@ class CredenciamentoParanaTests(TestCase):
 
         escola.refresh_from_db()
         self.assertTrue(escola.favorito)
+

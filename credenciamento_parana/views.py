@@ -1659,3 +1659,4 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
 </body>
 </html>"""
     return HttpResponse(pagina_html)
+

@@ -176,3 +176,4 @@ class OfertaCursoEscola(models.Model):
 
     def __str__(self) -> str:
         return f"{self.nome_curso} ({self.modalidade} - {self.turno}) — {self.escola.nome_escola}"
+

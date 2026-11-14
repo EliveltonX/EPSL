@@ -26,3 +26,4 @@ class Command(BaseCommand):
                 f"Ofertas de Cursos: {resultado['cursos_sincronizados']}"
             )
         )
+

@@ -48,3 +48,4 @@ class OfertaCursoEscolaAdmin(admin.ModelAdmin):
     )
     list_filter = ("tipo_modalidade", "turno", "nome_curso", "escola__municipio")
     search_fields = ("nome_curso", "escola__nome_escola", "escola__municipio", "escola__endereco")
+
