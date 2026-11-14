@@ -1144,13 +1144,17 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
         }}
 
         function inicializarMapa() {{
-            const osmLayer = L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
+            const osmLayer = L.tileLayer("https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
                 maxZoom: 19,
-                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
             }});
-            const cartoVoyager = L.tileLayer("https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}{{r}}.png", {{
+            const osmHotLayer = L.tileLayer("https://{{s}}.tile.openstreetmap.fr/hot/{{z}}/{{x}}/{{y}}.png", {{
                 maxZoom: 19,
-                attribution: '&copy; OpenStreetMap &copy; CARTO'
+                attribution: '&copy; OpenStreetMap contributors, Tiles style by <a href="https://www.hotosm.org/" target="_blank">HOT</a>'
+            }});
+            const openTopoLayer = L.tileLayer("https://{{s}}.tile.opentopomap.org/{{z}}/{{x}}/{{y}}.png", {{
+                maxZoom: 17,
+                attribution: 'Map data: &copy; OpenStreetMap contributors, SRTM | Map style: &copy; <a href="https://opentopomap.org">OpenTopoMap</a> (CC-BY-SA)'
             }});
             const esriSat = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}", {{
                 maxZoom: 19,
@@ -1160,12 +1164,13 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             map = L.map("leaflet-map", {{
                 center: [-24.65, -51.55],
                 zoom: 7,
-                layers: [cartoVoyager]
+                layers: [osmLayer]
             }});
 
             L.control.layers({{
-                "🗺️ Mapa Nítido (Carto Voyager)": cartoVoyager,
-                "🛣️ OpenStreetMap Padrão": osmLayer,
+                "🛣️ OpenStreetMap Oficial (Padrão Free)": osmLayer,
+                "🏥 OpenStreetMap Humanitarian (HOT)": osmHotLayer,
+                "⛰️ OpenTopoMap (Relevo e Rodovias)": openTopoLayer,
                 "🛰️ Satélite (Esri World Imagery)": esriSat
             }}, null, {{ position: "topright" }}).addTo(map);
 
