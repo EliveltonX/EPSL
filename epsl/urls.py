@@ -15,6 +15,8 @@ urlpatterns = [
     path("logout/", logout_view, name="logout"),
     # Rotas protegidas por autenticação (LoginRequiredMiddleware + @login_required)
     path("servidor/", painel_servidor, name="painel_servidor_atalho"),
+    path("credenciamento/", include("credenciamento_parana.urls")),
+    path("mapa-cursos/", include("credenciamento_parana.urls")),
     path("licitacoes/", include("licitacoes.urls")),
     path("api/licitacoes/processar/", acionar_processamento_diarios, name="api_processar_diarios"),
     path("media/<path:rel_path>", servir_media_protegida, name="servir_media_protegida"),

@@ -167,6 +167,7 @@ def home_status(request: HttpRequest) -> HttpResponse:
             <p>Olá, <strong>{username_esc}</strong>! Você tem acesso completo às páginas protegidas do sistema.</p>
             <div class="actions">
                 <a href="/licitacoes/" class="btn btn-primary">📄 Abrir Painel de Licitações</a>
+                <a href="/credenciamento/" class="btn btn-primary" style="background:#7c3aed;">🗺️ Mapa Credenciamento PR (147 Escolas)</a>
                 <a href="/licitacoes/upload/" class="btn btn-secondary">📤 Upload de Múltiplos PDFs</a>
                 <a href="/licitacoes/servidor/" class="btn btn-secondary">🖥️ Monitor do Servidor & Storage</a>
                 <a href="/admin/" class="btn btn-secondary">⚙️ Django Admin (/admin/)</a>
@@ -435,6 +436,7 @@ def painel_licitacoes(request: HttpRequest) -> HttpResponse:
         </div>
         <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
             <a href="/" class="btn btn-secondary">🏠 Página Inicial</a>
+            <a href="/credenciamento/" class="btn btn-primary" style="background:#7c3aed;">🗺️ Mapa Credenciamento PR (147 Escolas)</a>
             <a href="/licitacoes/upload/" class="btn btn-primary" style="background:#059669;">📤 Enviar PDFs (Upload Múltiplo)</a>
             <a href="/licitacoes/servidor/" class="btn btn-secondary">🖥️ Monitor do Servidor</a>
             <a href="/admin/" class="btn btn-secondary">⚙️ Admin</a>

@@ -79,6 +79,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     # Apps do projeto EPSL
     "licitacoes",
+    "credenciamento_parana",
 ]
 
 MIDDLEWARE = [
