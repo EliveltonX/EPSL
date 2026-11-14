@@ -145,19 +145,151 @@ def _porta_aberta(host: str, port: int, timeout: float = 0.25) -> bool:
         return False
 
 
+def _validar_e_preparar_postgres(
+    host: str,
+    port: int,
+    db_name: str,
+    configured_user: str,
+    db_password: str,
+    timeout: float = 2.0,
+) -> tuple[bool, str, str, bool, str]:
+    """
+    Testa se `host:port` está acessível E aceita autenticação PostgreSQL com as credenciais
+    do EPSL, diferenciando o container real `supabase-db` de outros containers PostgreSQL
+    que possam ter assumido o IP antigo na rede Docker do Coolify.
+
+    Retorna:
+      (autenticou_ok, usuario_resolvido, senha_resolvida, possui_assinatura_epsl, motivo)
+    """
+    if not _porta_aberta(host, port, timeout=min(timeout, 0.8)):
+        return (False, configured_user, db_password, False, "porta TCP fechada (Connection refused)")
+
+    try:
+        import psycopg
+    except Exception as exc:
+        return (True, configured_user, db_password, False, f"psycopg indisponivel ({exc})")
+
+    usuarios_cand = []
+    for u in (configured_user, "supabase_admin", "postgres"):
+        u_clean = (u or "").strip()
+        if u_clean and u_clean not in usuarios_cand:
+            usuarios_cand.append(u_clean)
+
+    senhas_cand = []
+    for s in (
+        db_password,
+        db_password.strip("\"'"),
+        os.getenv("SERVICE_PASSWORD_POSTGRES", "").strip(),
+        os.getenv("POSTGRES_PASSWORD", "").strip(),
+    ):
+        if s and s not in senhas_cand:
+            senhas_cand.append(s)
+    if not senhas_cand:
+        senhas_cand = [""]
+
+    ultimo_erro = "falha de autenticacao"
+    for senha_teste in senhas_cand:
+        for user_teste in usuarios_cand:
+            try:
+                with psycopg.connect(
+                    host=host,
+                    port=port,
+                    dbname=db_name,
+                    user=user_teste,
+                    password=senha_teste,
+                    connect_timeout=max(1, int(timeout)),
+                    autocommit=True,
+                ) as conn:
+                    with conn.cursor() as cur:
+                        # Verifica se este Postgres já possui tabelas do EPSL ou roles do Supabase
+                        cur.execute(
+                            """
+                            SELECT
+                                EXISTS (
+                                    SELECT 1 FROM pg_tables
+                                    WHERE schemaname = 'public'
+                                      AND tablename IN ('licitacoes', 'django_migrations', 'credenciamento_escolas')
+                                ) AS tem_tabelas,
+                                EXISTS (
+                                    SELECT 1 FROM pg_roles WHERE rolname = 'supabase_admin'
+                                ) AS eh_supabase,
+                                (
+                                    SELECT tableowner FROM pg_tables
+                                    WHERE schemaname = 'public' AND tablename = 'licitacoes'
+                                    LIMIT 1
+                                ) AS dono_licitacoes;
+                            """
+                        )
+                        row = cur.fetchone()
+                        tem_tabelas = bool(row and row[0])
+                        eh_supabase = bool(row and row[1])
+                        dono_tabela = str(row[2]).strip() if (row and row[2]) else None
+
+                        usuario_final = user_teste
+
+                        # Se a tabela `licitacoes` pertence a outra role (ex: `supabase_admin`),
+                        # garante permissões e usa a role dona para evitar erro `must be owner of table`
+                        if dono_tabela and dono_tabela != user_teste:
+                            try:
+                                cur.execute(f'SET ROLE "{dono_tabela}";')
+                                cur.execute(f'ALTER TABLE public.licitacoes OWNER TO "{user_teste}";')
+                                cur.execute("RESET ROLE;")
+                            except Exception:
+                                try:
+                                    with psycopg.connect(
+                                        host=host,
+                                        port=port,
+                                        dbname=db_name,
+                                        user=dono_tabela,
+                                        password=senha_teste,
+                                        connect_timeout=2,
+                                        autocommit=True,
+                                    ) as owner_conn:
+                                        with owner_conn.cursor() as ocur:
+                                            ocur.execute(
+                                                f'GRANT ALL PRIVILEGES ON SCHEMA public TO "{configured_user}", "{dono_tabela}";'
+                                            )
+                                            ocur.execute(
+                                                f'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO "{configured_user}", "{dono_tabela}";'
+                                            )
+                                            ocur.execute(
+                                                f'GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO "{configured_user}", "{dono_tabela}";'
+                                            )
+                                        usuario_final = dono_tabela
+                                except Exception:
+                                    pass
+
+                        return (
+                            True,
+                            usuario_final,
+                            senha_teste,
+                            (tem_tabelas or eh_supabase),
+                            f"autenticado (user={usuario_final}, tabelas_epsl={tem_tabelas}, supabase={eh_supabase})",
+                        )
+            except Exception as exc:
+                ultimo_erro = str(exc).splitlines()[0].strip()
+                continue
+
+    return (False, configured_user, db_password, False, ultimo_erro)
+
+
 def _descobrir_postgres_na_rede_docker(
     configured_host: str,
     port: int,
     db_name: str,
     db_user: str,
     db_password: str,
-) -> str | None:
+) -> tuple[str, str, str] | None:
     """
-    Quando o serviço do Supabase é reiniciado no Coolify, o Docker recria o container
-    `supabase-db` com um novo IP dinâmico na sub-rede Docker (ex: `10.0.1.10` -> `10.0.1.14`),
-    causando `Connection refused` no IP antigo.
-    Esta função varre em paralelo (< 0.3s) as sub-redes `/24` do container e nomes comuns
-    do Docker para localizar automaticamente o novo IP do PostgreSQL.
+    Quando o serviço do Supabase ou do Coolify é reiniciado, o Docker pode:
+    1. Recriar o container `supabase-db` em outro IP dinâmico (ex: `10.0.1.10` -> `10.0.1.5`);
+    2. Atribuir o IP antigo (`10.0.1.10`) a OUTRO container PostgreSQL da mesma rede Docker,
+       o que faria um simples teste de porta TCP (`5432`) passar, mas falhar com
+       `FATAL: password authentication failed for user "postgres"`.
+
+    Esta função varre em paralelo (< 0.4s) as sub-redes Docker e nomes de containers,
+    testa a autenticação real (`_validar_e_preparar_postgres`) em todos os IPs com porta 5432
+    aberta e retorna `(host_correto, user_correto, password_correta)` do nosso `supabase-db`.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -178,8 +310,8 @@ def _descobrir_postgres_na_rede_docker(
     except Exception:
         pass
 
-    if not prefixos_subrede:
-        prefixos_subrede.add("10.0.1")
+    # Garante sempre as sub-redes padrão do Coolify / Docker
+    prefixos_subrede.update(["10.0.1", "10.0.0"])
 
     candidatos = [
         "supabase-db",
@@ -188,14 +320,16 @@ def _descobrir_postgres_na_rede_docker(
         "172.17.0.1",
         "10.0.0.1",
     ]
+    vistos = set(candidatos)
     for prefixo in sorted(prefixos_subrede):
         for ultimo_octeto in range(1, 255):
             ip_cand = f"{prefixo}.{ultimo_octeto}"
-            if ip_cand != configured_host:
+            if ip_cand != configured_host and ip_cand not in vistos:
                 candidatos.append(ip_cand)
+                vistos.add(ip_cand)
 
     def _testar_cand(h: str) -> str | None:
-        return h if _porta_aberta(h, port, timeout=0.22) else None
+        return h if _porta_aberta(h, port, timeout=0.25) else None
 
     hosts_com_porta_5432 = []
     with ThreadPoolExecutor(max_workers=64) as executor:
@@ -206,114 +340,40 @@ def _descobrir_postgres_na_rede_docker(
     if not hosts_com_porta_5432:
         return None
 
-    # Valida qual dos hosts encontrados na porta 5432 aceita a autenticação do nosso banco
-    try:
-        import psycopg
+    autenticados_com_assinatura = []
+    autenticados_genericos = []
 
-        for h in hosts_com_porta_5432:
-            try:
-                conn = psycopg.connect(
-                    host=h,
-                    port=port,
-                    dbname=db_name,
-                    user=db_user,
-                    password=db_password,
-                    connect_timeout=2,
-                )
-                conn.close()
-                return h
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    return hosts_com_porta_5432[0]
-
-
-def _resolver_usuario_dono_postgres(
-    host: str,
-    port: int,
-    db_name: str,
-    configured_user: str,
-    db_password: str,
-) -> str:
-    """
-    No Supabase self-hosted (Coolify), o superusuário real do cluster PostgreSQL é
-    `supabase_admin` (que compartilha a mesma senha `SERVICE_PASSWORD_POSTGRES` do usuário `postgres`).
-    Se a tabela `licitacoes` foi criada originalmente por `supabase_admin` e o `DB_USER` estiver
-    como `postgres` (ou vice-versa), o comando `migrate` falha com:
-    `psycopg.errors.InsufficientPrivilege: must be owner of table licitacoes`.
-    Esta função detecta automaticamente o dono (`tableowner`) da tabela `licitacoes` (ou o superusuário
-    `supabase_admin`) e ajusta o usuário da conexão / permissões automaticamente.
-    """
-    try:
-        import psycopg
-
-        dono_tabela = None
-        with psycopg.connect(
-            host=host,
+    for h in hosts_com_porta_5432:
+        ok, user_ok, pass_ok, tem_assinatura, motivo = _validar_e_preparar_postgres(
+            host=h,
             port=port,
-            dbname=db_name,
-            user=configured_user,
-            password=db_password,
-            connect_timeout=2,
-            autocommit=True,
-        ) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT tableowner FROM pg_tables WHERE schemaname = 'public' AND tablename = 'licitacoes';"
-                )
-                row = cur.fetchone()
-                if row and row[0]:
-                    dono_tabela = str(row[0]).strip()
+            db_name=db_name,
+            configured_user=db_user,
+            db_password=db_password,
+            timeout=2.0,
+        )
+        _spaced_h = " ".join(h)
+        if ok:
+            print(
+                f"[EPSL-AUTO-DISCOVERY] Candidato [{_spaced_h}]:{port} aceitou autenticacao ({motivo}).",
+                file=sys.stderr,
+            )
+            if tem_assinatura:
+                autenticados_com_assinatura.append((h, user_ok, pass_ok))
+            else:
+                autenticados_genericos.append((h, user_ok, pass_ok))
+        else:
+            print(
+                f"[EPSL-AUTO-DISCOVERY] Ignorando [{_spaced_h}]:{port} -> pertence a outro container Postgres ({motivo}).",
+                file=sys.stderr,
+            )
 
-                if dono_tabela and dono_tabela != configured_user:
-                    # Tenta assumir a role dona na própria conexão ou transferir ownership
-                    try:
-                        cur.execute(f'SET ROLE "{dono_tabela}";')
-                        cur.execute(f'ALTER TABLE public.licitacoes OWNER TO "{configured_user}";')
-                        cur.execute("RESET ROLE;")
-                        return configured_user
-                    except Exception:
-                        pass
+    if autenticados_com_assinatura:
+        return autenticados_com_assinatura[0]
+    if autenticados_genericos:
+        return autenticados_genericos[0]
 
-        # Testa conectar diretamente com o dono da tabela ou com `supabase_admin`
-        candidatos_user = []
-        if dono_tabela and dono_tabela != configured_user:
-            candidatos_user.append(dono_tabela)
-        if "supabase_admin" not in candidatos_user and configured_user != "supabase_admin":
-            candidatos_user.append("supabase_admin")
-
-        for cand_user in candidatos_user:
-            try:
-                with psycopg.connect(
-                    host=host,
-                    port=port,
-                    dbname=db_name,
-                    user=cand_user,
-                    password=db_password,
-                    connect_timeout=2,
-                    autocommit=True,
-                ) as admin_conn:
-                    with admin_conn.cursor() as acur:
-                        acur.execute(
-                            f'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO "{configured_user}", "{cand_user}";'
-                        )
-                        acur.execute(
-                            f'GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO "{configured_user}", "{cand_user}";'
-                        )
-                    print(
-                        f"[EPSL-AUTO-DISCOVERY] Usando usuario proprietario do banco '{cand_user}' "
-                        f"(dono da tabela licitacoes: '{dono_tabela or cand_user}') para evitar erro de permissao em migrations.",
-                        file=sys.stderr,
-                    )
-                    return cand_user
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    return configured_user
+    return None
 
 
 if IS_DEPLOY:
@@ -329,35 +389,50 @@ if IS_DEPLOY:
     _is_collectstatic = "collectstatic" in sys.argv
     _spaced_host = " ".join(_clean_db_host)
 
-    if not _is_collectstatic and not _porta_aberta(_clean_db_host, _db_port, timeout=1.0):
-        print(
-            f"\n[EPSL-AUTO-DISCOVERY] O host configurado [{_spaced_host}]:{_db_port} recusou conexao "
-            "(provavelmente o container supabase-db trocou de IP ao reiniciar). Buscando novo IP na rede Docker...",
-            file=sys.stderr,
-        )
-        _novo_host = _descobrir_postgres_na_rede_docker(
-            configured_host=_clean_db_host,
-            port=_db_port,
-            db_name=_db_name,
-            db_user=_db_user,
-            db_password=_db_password,
-        )
-        if _novo_host:
-            _spaced_novo = " ".join(_novo_host)
-            print(
-                f"[EPSL-AUTO-DISCOVERY] PostgreSQL localizado automaticamente no novo endereco: [{_spaced_novo}]:{_db_port}!\n",
-                file=sys.stderr,
-            )
-            _clean_db_host = _novo_host
-
     if not _is_collectstatic:
-        _db_user = _resolver_usuario_dono_postgres(
+        _host_ok, _resolved_user, _resolved_pass, _, _motivo_host = _validar_e_preparar_postgres(
             host=_clean_db_host,
             port=_db_port,
             db_name=_db_name,
             configured_user=_db_user,
             db_password=_db_password,
+            timeout=1.5,
         )
+        if _host_ok:
+            _db_user = _resolved_user
+            _db_password = _resolved_pass
+        else:
+            print(
+                f"\n[EPSL-AUTO-DISCOVERY] O host configurado [{_spaced_host}]:{_db_port} falhou na verificacao "
+                f"({_motivo_host}). Provavelmente o container supabase-db trocou de IP na rede Docker e outro "
+                "container assumiu o IP antigo. Buscando o container supabase-db correto...",
+                file=sys.stderr,
+            )
+            _descoberto = _descobrir_postgres_na_rede_docker(
+                configured_host=_clean_db_host,
+                port=_db_port,
+                db_name=_db_name,
+                db_user=_db_user,
+                db_password=_db_password,
+            )
+            if _descoberto:
+                _novo_host, _novo_user, _nova_senha = _descoberto
+                _spaced_novo = " ".join(_novo_host)
+                print(
+                    f"[EPSL-AUTO-DISCOVERY] PostgreSQL do EPSL localizado e autenticado automaticamente em: "
+                    f"[{_spaced_novo}]:{_db_port} (user='{_novo_user}')!\n",
+                    file=sys.stderr,
+                )
+                _clean_db_host = _novo_host
+                _db_user = _novo_user
+                _db_password = _nova_senha
+            else:
+                print(
+                    f"[EPSL-AUTO-DISCOVERY] ALERTA: Nenhum container PostgreSQL na rede Docker aceitou a senha "
+                    f"configurada em DB_PASSWORD para o banco '{_db_name}'. Verifique se o container supabase-db "
+                    "esta rodando e conectado na rede 'coolify' ou se DB_PASSWORD corresponde a SERVICE_PASSWORD_POSTGRES.\n",
+                    file=sys.stderr,
+                )
 
     try:
         socket.getaddrinfo(_clean_db_host, _db_port)
