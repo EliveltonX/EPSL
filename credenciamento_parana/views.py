@@ -1394,7 +1394,7 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                 </div>
                 <div class="filter-group">
                     <label for="cfg-raio-km">📏 Raio de Proximidade (km)</label>
-                    <input type="number" id="cfg-raio-km" class="filter-input" value="200" min="1" max="1500" step="10"
+                    <input type="number" id="cfg-raio-km" class="filter-input" value="50" min="1" max="1500" step="5"
                            oninput="aplicarFiltros(true); atualizarCirculoRaioSeAtivo();">
                 </div>
                 <div class="filter-group">
@@ -1537,13 +1537,13 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
 
         function obterConfigTaxaDeslocamento() {{
             const taxaMaxRaw = parseFloat(document.getElementById("cfg-taxa-max")?.value ?? "20");
-            const raioKmRaw = parseFloat(document.getElementById("cfg-raio-km")?.value ?? "200");
+            const raioKmRaw = parseFloat(document.getElementById("cfg-raio-km")?.value ?? "50");
             const cursosMinRaw = parseInt(document.getElementById("cfg-cursos-min")?.value ?? "1", 10);
             const cursosZeroRaw = parseInt(document.getElementById("cfg-cursos-zero")?.value ?? "3", 10);
 
             return {{
                 taxaMaximaPct: Number.isFinite(taxaMaxRaw) && taxaMaxRaw >= 0 ? taxaMaxRaw : 20,
-                raioKm: Number.isFinite(raioKmRaw) && raioKmRaw > 0 ? raioKmRaw : 200,
+                raioKm: Number.isFinite(raioKmRaw) && raioKmRaw > 0 ? raioKmRaw : 50,
                 cursosMinTaxaMax: Number.isFinite(cursosMinRaw) && cursosMinRaw >= 1 ? cursosMinRaw : 1,
                 cursosMaxZeraTaxa: Number.isFinite(cursosZeroRaw) && cursosZeroRaw >= 1 ? cursosZeroRaw : 3
             }};
@@ -1601,7 +1601,7 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             const taxa = Number(escola._taxaDeslocamentoPct || 0);
             const qtdCursos = Number(escola._cursosNoRaio || 0);
             const qtdEscolas = Number(escola._escolasNoRaio || 1);
-            const raioKm = Number(escola._raioKmUsado || 200);
+            const raioKm = Number(escola._raioKmUsado || 50);
             const cfg = obterConfigTaxaDeslocamento();
 
             let cls = "rate-badge-zero";
@@ -2562,7 +2562,7 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                         c.ch_anual_coord,
                         c.ch_anual_sup_tecnico,
                         esc._cursosNoRaio || 0,
-                        esc._raioKmUsado || 200,
+                        esc._raioKmUsado || 50,
                         taxaPct.toFixed(2).replace(".", ","),
                         vhBase.toFixed(2).replace(".", ","),
                         vhComTaxa,
