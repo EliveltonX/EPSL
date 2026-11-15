@@ -177,3 +177,137 @@ class OfertaCursoEscola(models.Model):
     def __str__(self) -> str:
         return f"{self.nome_curso} ({self.modalidade} - {self.turno}) — {self.escola.nome_escola}"
 
+
+class TabelaPrecoCurso(models.Model):
+    """
+    Tabela de Preços e Rentabilidade por Curso Técnico e Modalidade (Integrado / Subsequente),
+    baseada em `Docs_Vault/referencial_Parana/precosCursos.csv`.
+    Cursos ainda sem preço definido iniciam com `0.00` e podem ser editados diretamente no Django Admin.
+    Modelagem estrita relacional (Zero JSONField).
+    """
+
+    TIPO_MODALIDADE_CHOICES = [
+        ("integrado", "Médio Integrado"),
+        ("subsequente", "Prof/Técnico (Subsequente)"),
+    ]
+
+    nome_curso = models.CharField(
+        max_length=160,
+        db_index=True,
+        verbose_name="Curso Técnico",
+    )
+    tipo_modalidade = models.CharField(
+        max_length=30,
+        choices=TIPO_MODALIDADE_CHOICES,
+        db_index=True,
+        verbose_name="Modalidade (Integrado / Subsequente)",
+    )
+    ch_anual_referencia = models.PositiveIntegerField(
+        default=400,
+        verbose_name="CH Anual de Referência (h)",
+    )
+    alunos_por_turma = models.PositiveIntegerField(
+        default=35,
+        verbose_name="Alunos por Turma (Ref.)",
+    )
+    valor_hora_aluno = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0,
+        verbose_name="H/Aluno (R$)",
+    )
+    valor_hora_turma = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="H/Turma (R$)",
+    )
+    valor_turma_ano = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+        verbose_name="Turma/ANO (R$)",
+    )
+    lucro_ano_1a3 = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+        verbose_name="Lucro/Ano/Turma até 3º ano (R$)",
+    )
+    lucro_ano_4a5 = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+        verbose_name="Lucro/Ano/Turma 4º e 5º ano (R$)",
+    )
+    lucro_medio_5anos = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+        verbose_name="Lucro Médio nos 5 anos (R$)",
+    )
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "credenciamento_precos_cursos"
+        ordering = ["nome_curso", "tipo_modalidade"]
+        verbose_name = "Preço de Curso (H/Aluno)"
+        verbose_name_plural = "Tabela de Preços dos Cursos (H/Aluno)"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["nome_curso", "tipo_modalidade"],
+                name="uniq_preco_curso_modalidade",
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        from decimal import Decimal, ROUND_HALF_UP
+
+        vh_aluno = Decimal(str(self.valor_hora_aluno or 0))
+        if vh_aluno <= Decimal("0"):
+            self.valor_hora_aluno = Decimal("0.00")
+            self.valor_hora_turma = Decimal("0.00")
+            self.valor_turma_ano = Decimal("0.00")
+            self.lucro_ano_1a3 = Decimal("0.00")
+            self.lucro_ano_4a5 = Decimal("0.00")
+            self.lucro_medio_5anos = Decimal("0.00")
+        else:
+            recalcular_derivados = False
+            if self.pk:
+                antigo = TabelaPrecoCurso.objects.filter(pk=self.pk).first()
+                if antigo and Decimal(str(antigo.valor_hora_aluno or 0)) != vh_aluno:
+                    # Se o usuário alterou o H/Aluno no Admin e manteve o H/Turma antigo, recalcula tudo
+                    if Decimal(str(antigo.valor_hora_turma or 0)) == Decimal(str(self.valor_hora_turma or 0)):
+                        recalcular_derivados = True
+
+            alunos = Decimal(str(self.alunos_por_turma or 35))
+            ch = Decimal(str(self.ch_anual_referencia or (400 if self.tipo_modalidade == "integrado" else 800)))
+            if recalcular_derivados or Decimal(str(self.valor_hora_turma or 0)) <= Decimal("0"):
+                self.valor_hora_turma = (vh_aluno * alunos).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if recalcular_derivados or Decimal(str(self.valor_turma_ano or 0)) <= Decimal("0"):
+                self.valor_turma_ano = (Decimal(str(self.valor_hora_turma)) * ch).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+            turma_ano = Decimal(str(self.valor_turma_ano))
+            if recalcular_derivados or Decimal(str(self.lucro_ano_1a3 or 0)) <= Decimal("0"):
+                self.lucro_ano_1a3 = (turma_ano * Decimal("0.18")).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+            if recalcular_derivados or Decimal(str(self.lucro_ano_4a5 or 0)) <= Decimal("0"):
+                self.lucro_ano_4a5 = (turma_ano * Decimal("0.348")).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+            if recalcular_derivados or Decimal(str(self.lucro_medio_5anos or 0)) <= Decimal("0"):
+                l13 = Decimal(str(self.lucro_ano_1a3))
+                l45 = Decimal(str(self.lucro_ano_4a5))
+                self.lucro_medio_5anos = ((l13 * Decimal("3") + l45 * Decimal("2")) / Decimal("5")).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+
+        super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        mod_label = "Integrado" if self.tipo_modalidade == "integrado" else "Subsequente"
+        return f"{self.nome_curso} ({mod_label}) — R$ {self.valor_hora_aluno}/H-Aluno"
+
+

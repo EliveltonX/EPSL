@@ -1,6 +1,39 @@
 from django.contrib import admin
 
-from credenciamento_parana.models import EscolaCredenciamento, OfertaCursoEscola
+from credenciamento_parana.models import (
+    EscolaCredenciamento,
+    OfertaCursoEscola,
+    TabelaPrecoCurso,
+)
+
+
+@admin.register(TabelaPrecoCurso)
+class TabelaPrecoCursoAdmin(admin.ModelAdmin):
+    list_display = (
+        "nome_curso",
+        "tipo_modalidade",
+        "ch_anual_referencia",
+        "alunos_por_turma",
+        "valor_hora_aluno",
+        "valor_hora_turma",
+        "valor_turma_ano",
+        "lucro_ano_1a3",
+        "lucro_ano_4a5",
+        "lucro_medio_5anos",
+        "atualizado_em",
+    )
+    list_editable = (
+        "valor_hora_aluno",
+        "valor_hora_turma",
+        "valor_turma_ano",
+        "lucro_ano_1a3",
+        "lucro_ano_4a5",
+        "lucro_medio_5anos",
+    )
+    list_filter = ("tipo_modalidade", "ch_anual_referencia")
+    search_fields = ("nome_curso",)
+    ordering = ("nome_curso", "tipo_modalidade")
+
 
 
 class OfertaCursoEscolaInline(admin.TabularInline):

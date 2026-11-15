@@ -4,8 +4,13 @@ do arquivo `Docs_Vault/referencial_Parana/Termo_de_Referência_Inicial_Credencia
 (Protocolo nº 26.748.363-9 — SEED/PR), com coordenadas geográficas verificadas por endereço/CEP.
 """
 
+from decimal import Decimal
 from django.db import transaction
-from credenciamento_parana.models import EscolaCredenciamento, OfertaCursoEscola
+from credenciamento_parana.models import (
+    EscolaCredenciamento,
+    OfertaCursoEscola,
+    TabelaPrecoCurso,
+)
 
 ESCOLAS_ANEXO_I = [{'item': 1,
   'nucleo': 'APUCARANA',
@@ -3712,18 +3717,143 @@ ESCOLAS_ANEXO_I = [{'item': 1,
   'geo_address': 'Avenida Da Estacao 1750, Umuarama, Paraná, 87503-020'}]
 
 
+PRECOS_INICIAIS_CSV = {
+    ("INTELIGÊNCIA ARTIFICIAL", "integrado"): {
+        "ch_anual_referencia": 400,
+        "alunos_por_turma": 35,
+        "valor_hora_aluno": Decimal("25.85"),
+        "valor_hora_turma": Decimal("904.77"),
+        "valor_turma_ano": Decimal("361907.18"),
+        "lucro_ano_1a3": Decimal("65143.29"),
+        "lucro_ano_4a5": Decimal("125943.70"),
+        "lucro_medio_5anos": Decimal("89463.46"),
+    },
+    ("DESENVOLVIMENTO DE SISTEMAS", "integrado"): {
+        "ch_anual_referencia": 400,
+        "alunos_por_turma": 35,
+        "valor_hora_aluno": Decimal("24.20"),
+        "valor_hora_turma": Decimal("847.09"),
+        "valor_turma_ano": Decimal("338836.18"),
+        "lucro_ano_1a3": Decimal("60990.51"),
+        "lucro_ano_4a5": Decimal("117914.99"),
+        "lucro_medio_5anos": Decimal("83760.30"),
+    },
+    ("DESIGN GRÁFICO", "integrado"): {
+        "ch_anual_referencia": 400,
+        "alunos_por_turma": 35,
+        "valor_hora_aluno": Decimal("26.37"),
+        "valor_hora_turma": Decimal("923.04"),
+        "valor_turma_ano": Decimal("369216.75"),
+        "lucro_ano_1a3": Decimal("66459.02"),
+        "lucro_ano_4a5": Decimal("128487.43"),
+        "lucro_medio_5anos": Decimal("91270.38"),
+    },
+    ("INTELIGÊNCIA ARTIFICIAL", "subsequente"): {
+        "ch_anual_referencia": 800,
+        "alunos_por_turma": 35,
+        "valor_hora_aluno": Decimal("14.40"),
+        "valor_hora_turma": Decimal("503.83"),
+        "valor_turma_ano": Decimal("403065.38"),
+        "lucro_ano_1a3": Decimal("72551.77"),
+        "lucro_ano_4a5": Decimal("140266.75"),
+        "lucro_medio_5anos": Decimal("99637.76"),
+    },
+    ("DESENVOLVIMENTO DE SISTEMAS", "subsequente"): {
+        "ch_anual_referencia": 800,
+        "alunos_por_turma": 35,
+        "valor_hora_aluno": Decimal("13.57"),
+        "valor_hora_turma": Decimal("474.99"),
+        "valor_turma_ano": Decimal("379994.39"),
+        "lucro_ano_1a3": Decimal("68398.99"),
+        "lucro_ano_4a5": Decimal("132238.05"),
+        "lucro_medio_5anos": Decimal("93934.61"),
+    },
+    ("DESIGN GRÁFICO", "subsequente"): {
+        "ch_anual_referencia": 800,
+        "alunos_por_turma": 35,
+        "valor_hora_aluno": Decimal("14.66"),
+        "valor_hora_turma": Decimal("512.97"),
+        "valor_turma_ano": Decimal("410374.95"),
+        "lucro_ano_1a3": Decimal("73867.49"),
+        "lucro_ano_4a5": Decimal("142810.48"),
+        "lucro_medio_5anos": Decimal("101444.69"),
+    },
+}
+
+
+def sincronizar_tabela_precos_cursos(forcar_atualizacao: bool = False) -> int:
+    """
+    Garante que todos os pares `(nome_curso, tipo_modalidade)` presentes no Anexo I
+    (e os 6 cursos do `precosCursos.csv`) existam na tabela `TabelaPrecoCurso`.
+    - Os 6 cursos do CSV recebem seus valores reais de H/Aluno, H/Turma, Turma/Ano e Lucros.
+    - Os demais cursos são inicializados com valor `0.00` para edição direta pelo Django Admin,
+      preservando quaisquer valores > 0 já editados pelo administrador.
+    """
+    combinacoes_cursos = {}
+    for (nome_c, tipo_m), dados_csv in PRECOS_INICIAIS_CSV.items():
+        combinacoes_cursos[(nome_c, tipo_m)] = dados_csv["ch_anual_referencia"]
+
+    for item_data in ESCOLAS_ANEXO_I:
+        for c in item_data["cursos"]:
+            mod_str = c["modalidade"]
+            tipo_mod = (
+                "subsequente"
+                if "subsequente" in mod_str.lower() or "prof/técnico" in mod_str.lower()
+                else "integrado"
+            )
+            chave = (c["curso"], tipo_mod)
+            if chave not in combinacoes_cursos:
+                combinacoes_cursos[chave] = int(c["ch_anual_curso"])
+
+    total_existentes = TabelaPrecoCurso.objects.count()
+    if not forcar_atualizacao and total_existentes >= len(combinacoes_cursos):
+        return total_existentes
+
+    with transaction.atomic():
+        for (nome_curso, tipo_mod), ch_ref in sorted(combinacoes_cursos.items()):
+            dados_csv = PRECOS_INICIAIS_CSV.get((nome_curso, tipo_mod))
+            defaults_criacao = (
+                dict(dados_csv)
+                if dados_csv
+                else {
+                    "ch_anual_referencia": ch_ref,
+                    "alunos_por_turma": 35,
+                    "valor_hora_aluno": Decimal("0.00"),
+                    "valor_hora_turma": Decimal("0.00"),
+                    "valor_turma_ano": Decimal("0.00"),
+                    "lucro_ano_1a3": Decimal("0.00"),
+                    "lucro_ano_4a5": Decimal("0.00"),
+                    "lucro_medio_5anos": Decimal("0.00"),
+                }
+            )
+            obj, created = TabelaPrecoCurso.objects.get_or_create(
+                nome_curso=nome_curso,
+                tipo_modalidade=tipo_mod,
+                defaults=defaults_criacao,
+            )
+            # Se já existia zerado mas consta no CSV inicial, preenche os valores do CSV
+            if not created and dados_csv and (forcar_atualizacao or obj.valor_hora_aluno == Decimal("0.00")):
+                for campo, valor in dados_csv.items():
+                    setattr(obj, campo, valor)
+                obj.save()
+
+    return TabelaPrecoCurso.objects.count()
+
+
 def sincronizar_escolas_credenciamento(forcar_atualizacao: bool = False) -> dict:
     """
     Garante que todas as 147 escolas e seus respectivos cursos do Anexo I estejam
-    cadastrados no banco de dados relacional (`EscolaCredenciamento` e `OfertaCursoEscola`).
-    Preserva os favoritos e observações já salvos pelos usuários.
+    cadastrados no banco de dados relacional (`EscolaCredenciamento`, `OfertaCursoEscola` e `TabelaPrecoCurso`).
+    Preserva os favoritos, observações e preços customizados já salvos pelos usuários.
     """
+    precos_sincronizados = sincronizar_tabela_precos_cursos(forcar_atualizacao=forcar_atualizacao)
     total_existentes = EscolaCredenciamento.objects.count()
     total_cursos_existentes = OfertaCursoEscola.objects.count()
     if not forcar_atualizacao and total_existentes >= 147 and total_cursos_existentes >= 214:
         return {
             "escolas_sincronizadas": total_existentes,
             "cursos_sincronizados": total_cursos_existentes,
+            "precos_sincronizados": precos_sincronizados,
             "executado": False,
         }
 

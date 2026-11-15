@@ -12,15 +12,24 @@ from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST
 
 from credenciamento_parana.dados_anexo1 import sincronizar_escolas_credenciamento
-from credenciamento_parana.models import EscolaCredenciamento, OfertaCursoEscola
+from credenciamento_parana.models import (
+    EscolaCredenciamento,
+    OfertaCursoEscola,
+    TabelaPrecoCurso,
+)
 
 
 def _serializar_escolas_com_cursos() -> list[dict]:
     """
-    Garante que o banco contenha as 147 escolas e 214 ofertas de cursos do Anexo I
-    e retorna a lista completa estruturada para o mapa Leaflet e listagem dinâmica.
+    Garante que o banco contenha as 147 escolas, 214 ofertas de cursos do Anexo I
+    e a Tabela de Preços (`TabelaPrecoCurso`), retornando a lista completa estruturada
+    para o mapa Leaflet, cálculo de taxa de deslocamento e listagem dinâmica.
     """
     sincronizar_escolas_credenciamento(forcar_atualizacao=False)
+    mapa_precos = {
+        (p.nome_curso, p.tipo_modalidade): p
+        for p in TabelaPrecoCurso.objects.all()
+    }
     escolas_qs = EscolaCredenciamento.objects.prefetch_related("ofertas_cursos").order_by("item_edital")
 
     resultado = []
@@ -44,6 +53,15 @@ def _serializar_escolas_com_cursos() -> list[dict]:
             tipos_mod_set.add(of.tipo_modalidade)
             turnos_set.add(of.turno)
 
+            preco_obj = mapa_precos.get((of.nome_curso, of.tipo_modalidade))
+            vh_aluno = float(preco_obj.valor_hora_aluno) if preco_obj else 0.0
+            vh_turma = float(preco_obj.valor_hora_turma) if preco_obj else 0.0
+            v_turma_ano = float(preco_obj.valor_turma_ano) if preco_obj else 0.0
+            v_lucro_1a3 = float(preco_obj.lucro_ano_1a3) if preco_obj else 0.0
+            v_lucro_4a5 = float(preco_obj.lucro_ano_4a5) if preco_obj else 0.0
+            v_lucro_medio = float(preco_obj.lucro_medio_5anos) if preco_obj else 0.0
+            alunos_ref = int(preco_obj.alunos_por_turma) if preco_obj else 35
+
             cursos_list.append(
                 {
                     "id": of.id,
@@ -56,6 +74,13 @@ def _serializar_escolas_com_cursos() -> list[dict]:
                     "turmas": of.turmas,
                     "turno": of.turno,
                     "ch_total_oferta": ch_total_oferta,
+                    "alunos_por_turma": alunos_ref,
+                    "valor_hora_aluno": vh_aluno,
+                    "valor_hora_turma": vh_turma,
+                    "valor_turma_ano": v_turma_ano,
+                    "lucro_ano_1a3": v_lucro_1a3,
+                    "lucro_ano_4a5": v_lucro_4a5,
+                    "lucro_medio_5anos": v_lucro_medio,
                 }
             )
 
@@ -1020,6 +1045,77 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             background: #eff6ff;
             border-color: #bfdbfe;
         }}
+        .pricing-rate-panel {{
+            margin-top: 14px;
+            padding: 12px 14px;
+            background: linear-gradient(135deg, #f0fdf4, #eff6ff);
+            border: 1px solid #bfdbfe;
+            border-radius: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }}
+        .pricing-rate-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }}
+        .pricing-rate-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(195px, 1fr));
+            gap: 10px;
+            align-items: end;
+        }}
+        .rate-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 3px 9px;
+            border-radius: 999px;
+            font-size: 0.74rem;
+            font-weight: 800;
+        }}
+        .rate-badge-zero {{
+            background: #dcfce7;
+            color: #166534;
+            border: 1px solid #86efac;
+        }}
+        .rate-badge-mid {{
+            background: #fef3c7;
+            color: #92400e;
+            border: 1px solid #fcd34d;
+        }}
+        .rate-badge-max {{
+            background: #fee2e2;
+            color: #991b1b;
+            border: 1px solid #fca5a5;
+        }}
+        .price-tag-box {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: #f0fdf4;
+            border: 1px solid #bbf7d0;
+            color: #166534;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 0.76rem;
+            font-weight: 700;
+        }}
+        .price-tag-zero {{
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: #f8fafc;
+            border: 1px solid #cbd5e1;
+            color: #64748b;
+            padding: 2px 7px;
+            border-radius: 6px;
+            font-size: 0.74rem;
+            font-weight: 600;
+        }}
     </style>
 </head>
 <body>
@@ -1027,14 +1123,15 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
     <div class="topbar">
         <div class="topbar-title">
             <h1>🗺️ Mapeamento de Escolas e Cursos — Credenciamento SEED/PR (Anexo I)</h1>
-            <span>Protocolo nº 26.748.363-9 • 147 Escolas Estaduais • 22 Cursos Integrados & 13 Cursos Subsequentes • Usuário: <strong>{username_esc}</strong></span>
+            <span>Protocolo nº 26.748.363-9 • 147 Escolas Estaduais • Preços H/Aluno & Taxa de Deslocamento Regional • Usuário: <strong>{username_esc}</strong></span>
         </div>
         <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
             <a href="/" class="btn btn-secondary">🏠 Início</a>
             <a href="/licitacoes/" class="btn btn-secondary">📄 Painel de Licitações</a>
             <a href="/licitacoes/upload/" class="btn btn-secondary">📤 Upload de PDFs</a>
             <a href="/licitacoes/servidor/" class="btn btn-secondary">🖥️ Monitor do Servidor</a>
-            <a href="/admin/credenciamento_parana/escolacredenciamento/" class="btn btn-secondary">⚙️ Admin Escolas</a>
+            <a href="/admin/credenciamento_parana/tabelaprecocurso/" class="btn btn-emerald" target="_blank">💰 Preços H/Aluno (Admin)</a>
+            <a href="/admin/credenciamento_parana/escolacredenciamento/" class="btn btn-secondary" target="_blank">⚙️ Admin Escolas</a>
         </div>
     </div>
 
@@ -1054,6 +1151,11 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             <span class="kpi-label">👥 Total de Turmas & CH Anual</span>
             <span class="kpi-val" id="kpi-turmas">215 turmas</span>
             <span class="kpi-sub" id="kpi-ch-sub">Soma CH Anual (hora-relógio)</span>
+        </div>
+        <div class="kpi-card" style="border-color:#bbf7d0; background:#f0fdf4;">
+            <span class="kpi-label" style="color:#166534;">💰 Receita Anual (c/ Taxa Desloc.)</span>
+            <span class="kpi-val" id="kpi-receita-anual" style="color:#15803d; font-size:1.25rem;">R$ 0,00</span>
+            <span class="kpi-sub" id="kpi-lucro-sub" style="color:#166534;">Lucro Médio 5 anos: R$ 0,00</span>
         </div>
         <div class="kpi-card" style="border-color:#fde68a; background:#fffdf7;">
             <span class="kpi-label" style="color:#b45309;">⭐ Escolas Favoritas Marcadas</span>
@@ -1263,6 +1365,50 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             <button type="button" class="chip-btn" onclick="selecionarChipCurso('ENFERMAGEM')">🩺 Enfermagem</button>
             <button type="button" class="chip-btn" onclick="selecionarChipCurso('GASTRONOMIA')">🍽️ Gastronomia</button>
         </div>
+
+        <!-- Painel de Taxa Percentual de Deslocamento por Densidade Regional e Preço Hora/Aluno -->
+        <div class="pricing-rate-panel">
+            <div class="pricing-rate-header">
+                <div>
+                    <strong style="font-size:0.9rem; color:#0f172a;">🚗 Taxa de Deslocamento por Densidade Regional &amp; Preço Hora/Aluno</strong>
+                    <span style="font-size:0.78rem; color:#475569; margin-left:6px;">
+                        Calculada somente sobre os <strong>cursos filtrados</strong> dentro do raio. Quanto menos cursos próximos, maior a taxa percentual.
+                    </span>
+                </div>
+                <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                    <label style="font-size:0.78rem; font-weight:700; color:#1e40af; display:flex; align-items:center; gap:5px; cursor:pointer;">
+                        <input type="checkbox" id="chk-mostrar-raio" checked onchange="atualizarCirculoRaioSeAtivo()">
+                        ⭕ Desenhar círculo do raio no mapa ao clicar numa escola
+                    </label>
+                    <a href="/admin/credenciamento_parana/tabelaprecocurso/" target="_blank"
+                       style="font-size:0.76rem; font-weight:700; color:#15803d; text-decoration:none; background:#dcfce7; padding:4px 10px; border-radius:6px; border:1px solid #86efac;">
+                        ⚙️ Editar Preços (R$ 0,00) no Django Admin ↗
+                    </a>
+                </div>
+            </div>
+            <div class="pricing-rate-grid">
+                <div class="filter-group">
+                    <label for="cfg-taxa-max">📈 Taxa Máxima de Deslocamento (%)</label>
+                    <input type="number" id="cfg-taxa-max" class="filter-input" value="20" min="0" max="300" step="0.5"
+                           oninput="aplicarFiltros(true)">
+                </div>
+                <div class="filter-group">
+                    <label for="cfg-raio-km">📏 Raio de Proximidade (km)</label>
+                    <input type="number" id="cfg-raio-km" class="filter-input" value="200" min="1" max="1500" step="10"
+                           oninput="aplicarFiltros(true); atualizarCirculoRaioSeAtivo();">
+                </div>
+                <div class="filter-group">
+                    <label for="cfg-cursos-min">🔴 Qtd. Mín. Cursos no Raio (Atinge Taxa Máx.)</label>
+                    <input type="number" id="cfg-cursos-min" class="filter-input" value="1" min="1" max="100" step="1"
+                           oninput="aplicarFiltros(true)">
+                </div>
+                <div class="filter-group">
+                    <label for="cfg-cursos-zero">🟢 Qtd. Máx. Cursos no Raio (Zera a Taxa = 0%)</label>
+                    <input type="number" id="cfg-cursos-zero" class="filter-input" value="3" min="1" max="200" step="1"
+                           oninput="aplicarFiltros(true)">
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- Map + Favorites Verification Panel -->
@@ -1325,11 +1471,12 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                 <thead>
                     <tr>
                         <th style="width:125px;">Favorito / Mapa</th>
-                        <th style="width:70px;">Item</th>
-                        <th style="width:190px;">Município / Núcleo (NRE)</th>
-                        <th style="width:270px;">Estabelecimento / Cód. MEC</th>
-                        <th style="width:270px;">Endereço / Contato (Anexo IV)</th>
-                        <th>Cursos Ofertados na Escola (Modalidade, Curso, Turno, Turmas e CH Anual)</th>
+                        <th style="width:65px;">Item</th>
+                        <th style="width:180px;">Município / Núcleo (NRE)</th>
+                        <th style="width:240px;">Estabelecimento / Cód. MEC</th>
+                        <th style="width:230px;">Endereço / Contato (Anexo IV)</th>
+                        <th style="width:185px;">Proximidade &amp; Taxa Desloc.</th>
+                        <th>Cursos Ofertados, Preço Hora/Aluno (Base &rarr; c/ Taxa), Turma/Ano e Lucro</th>
                     </tr>
                 </thead>
                 <tbody id="tabela-escolas-body">
@@ -1349,6 +1496,8 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
 
         let map = null;
         let markersLayer = null;
+        let radiusCircleLayer = null;
+        let escolaFocadaRaio = null;
         const markersByItem = new Map();
         let filtroApenasFavoritos = false;
         let escolasFiltradasAtuais = [...ESCOLAS_DATA];
@@ -1366,6 +1515,152 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             const div = document.createElement("div");
             div.textContent = str == null ? "" : String(str);
             return div.innerHTML;
+        }}
+
+        function formatarMoedaBRL(valor) {{
+            const num = Number(valor || 0);
+            return num.toLocaleString("pt-BR", {{ style: "currency", currency: "BRL" }});
+        }}
+
+        function distanciaHaversineKm(lat1, lon1, lat2, lon2) {{
+            const R = 6371.0; // Raio médio da Terra em km
+            const toRad = deg => (deg * Math.PI) / 180.0;
+            const dLat = toRad(lat2 - lat1);
+            const dLon = toRad(lon2 - lon1);
+            const a =
+                Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+                Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            return R * c;
+        }}
+
+        function obterConfigTaxaDeslocamento() {{
+            const taxaMaxRaw = parseFloat(document.getElementById("cfg-taxa-max")?.value ?? "20");
+            const raioKmRaw = parseFloat(document.getElementById("cfg-raio-km")?.value ?? "200");
+            const cursosMinRaw = parseInt(document.getElementById("cfg-cursos-min")?.value ?? "1", 10);
+            const cursosZeroRaw = parseInt(document.getElementById("cfg-cursos-zero")?.value ?? "3", 10);
+
+            return {{
+                taxaMaximaPct: Number.isFinite(taxaMaxRaw) && taxaMaxRaw >= 0 ? taxaMaxRaw : 20,
+                raioKm: Number.isFinite(raioKmRaw) && raioKmRaw > 0 ? raioKmRaw : 200,
+                cursosMinTaxaMax: Number.isFinite(cursosMinRaw) && cursosMinRaw >= 1 ? cursosMinRaw : 1,
+                cursosMaxZeraTaxa: Number.isFinite(cursosZeroRaw) && cursosZeroRaw >= 1 ? cursosZeroRaw : 3
+            }};
+        }}
+
+        function calcularTaxasDeslocamento(escolasVisiveis, filtros) {{
+            const cfg = obterConfigTaxaDeslocamento();
+            const temFiltroCurso = temFiltroCursoOuTurnoOuModalidade(filtros);
+
+            // 1. Para cada escola visível, conta quantos cursos FILTRADOS ela possui
+            for (const esc of escolasVisiveis) {{
+                const cursosQuePassam = temFiltroCurso
+                    ? esc.cursos.filter(c => cursoPassaFiltroIndividual(c, filtros))
+                    : esc.cursos;
+                // Se a escola entrou pelo filtro "ambas_modalidades", garante ao menos os cursos da escola
+                esc._qtdCursosFiltradosLocal = cursosQuePassam.length > 0 ? cursosQuePassam.length : esc.cursos.length;
+            }}
+
+            // 2. Para cada escola visível, soma os cursos filtrados de todas as escolas visíveis dentro do raio (ex: 200km)
+            for (const escA of escolasVisiveis) {{
+                let totalCursosNoRaio = 0;
+                let totalEscolasNoRaio = 0;
+
+                for (const escB of escolasVisiveis) {{
+                    const distKm = (escA.id === escB.id)
+                        ? 0
+                        : distanciaHaversineKm(escA.latitude, escA.longitude, escB.latitude, escB.longitude);
+                    if (distKm <= cfg.raioKm) {{
+                        totalCursosNoRaio += escB._qtdCursosFiltradosLocal;
+                        totalEscolasNoRaio += 1;
+                    }}
+                }}
+
+                let taxaPct = 0.0;
+                if (cfg.taxaMaximaPct > 0) {{
+                    if (totalCursosNoRaio <= cfg.cursosMinTaxaMax) {{
+                        taxaPct = cfg.taxaMaximaPct;
+                    }} else if (totalCursosNoRaio >= cfg.cursosMaxZeraTaxa || cfg.cursosMaxZeraTaxa <= cfg.cursosMinTaxaMax) {{
+                        taxaPct = 0.0;
+                    }} else {{
+                        const proporcao = (cfg.cursosMaxZeraTaxa - totalCursosNoRaio) / (cfg.cursosMaxZeraTaxa - cfg.cursosMinTaxaMax);
+                        taxaPct = cfg.taxaMaximaPct * proporcao;
+                    }}
+                }}
+
+                escA._cursosNoRaio = totalCursosNoRaio;
+                escA._escolasNoRaio = totalEscolasNoRaio;
+                escA._taxaDeslocamentoPct = Math.round(taxaPct * 100) / 100;
+                escA._fatorTaxa = 1.0 + (escA._taxaDeslocamentoPct / 100.0);
+                escA._raioKmUsado = cfg.raioKm;
+            }}
+        }}
+
+        function montarBadgeTaxaDeslocamento(escola) {{
+            const taxa = Number(escola._taxaDeslocamentoPct || 0);
+            const qtdCursos = Number(escola._cursosNoRaio || 0);
+            const qtdEscolas = Number(escola._escolasNoRaio || 1);
+            const raioKm = Number(escola._raioKmUsado || 200);
+            const cfg = obterConfigTaxaDeslocamento();
+
+            let cls = "rate-badge-zero";
+            let icone = "🟢";
+            if (taxa > 0 && taxa >= cfg.taxaMaximaPct - 0.01) {{
+                cls = "rate-badge-max";
+                icone = "🔴";
+            }} else if (taxa > 0) {{
+                cls = "rate-badge-mid";
+                icone = "🟡";
+            }}
+
+            const taxaStr = taxa.toLocaleString("pt-BR", {{ minimumFractionDigits: 1, maximumFractionDigits: 2 }});
+            return `
+                <div style="display:flex; flex-direction:column; gap:4px;">
+                    <span class="rate-badge ${{cls}}">
+                        ${{icone}} Taxa Desloc.: +${{taxaStr}}%
+                    </span>
+                    <span style="font-size:0.74rem; color:#475569; font-weight:600;">
+                        📍 <strong>${{qtdCursos}}</strong> curso(s) filtrado(s) em <strong>${{raioKm}} km</strong> (${{qtdEscolas}} esc.)
+                    </span>
+                </div>
+            `;
+        }}
+
+        function desenharCirculoRaioEscola(escola) {{
+            if (!map) return;
+            escolaFocadaRaio = escola;
+            if (radiusCircleLayer) {{
+                map.removeLayer(radiusCircleLayer);
+                radiusCircleLayer = null;
+            }}
+            const mostrar = document.getElementById("chk-mostrar-raio")?.checked;
+            if (!mostrar || !escola) return;
+
+            const cfg = obterConfigTaxaDeslocamento();
+            const taxa = Number(escola._taxaDeslocamentoPct || 0);
+            let corCirculo = "#16a34a";
+            if (taxa > 0 && taxa >= cfg.taxaMaximaPct - 0.01) {{
+                corCirculo = "#dc2626";
+            }} else if (taxa > 0) {{
+                corCirculo = "#d97706";
+            }}
+
+            radiusCircleLayer = L.circle([escola.latitude, escola.longitude], {{
+                radius: cfg.raioKm * 1000,
+                color: corCirculo,
+                weight: 2,
+                dashArray: "6, 6",
+                fillColor: corCirculo,
+                fillOpacity: 0.08,
+                interactive: false
+            }}).addTo(map);
+        }}
+
+        function atualizarCirculoRaioSeAtivo() {{
+            if (escolaFocadaRaio) {{
+                desenharCirculoRaioEscola(escolaFocadaRaio);
+            }}
         }}
 
         function classeBadgeTurno(turno) {{
@@ -1541,6 +1836,8 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             const gmapsUrl = `https://www.google.com/maps/search/?api=1&query=${{encodeURIComponent(escola.endereco + ", " + escola.municipio + " - PR")}}`;
             let cursosHtml = "";
             const destacarCursos = filtrosAtivos ? temFiltroCursoOuTurnoOuModalidade(filtrosAtivos) : false;
+            const fatorTaxa = Number(escola._fatorTaxa || 1.0);
+            const taxaPct = Number(escola._taxaDeslocamentoPct || 0.0);
 
             for (const c of escola.cursos) {{
                 const isMatch = destacarCursos ? cursoPassaFiltroIndividual(c, filtrosAtivos) : false;
@@ -1548,6 +1845,26 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                     ? `<span class="badge badge-subsequente">Subsequente</span>`
                     : `<span class="badge badge-integrado">Médio Integrado</span>`;
                 const badgeTurno = `<span class="badge ${{classeBadgeTurno(c.turno)}}">${{escaparHtml(c.turno)}}</span>`;
+
+                const vhBase = Number(c.valor_hora_aluno || 0);
+                let blocoPrecoHtml = "";
+                if (vhBase > 0) {{
+                    const vhFinal = vhBase * fatorTaxa;
+                    const vTurmaAnoFinal = Number(c.valor_turma_ano || 0) * fatorTaxa * Number(c.turmas || 1);
+                    const vLucroMedioFinal = Number(c.lucro_medio_5anos || 0) * fatorTaxa * Number(c.turmas || 1);
+                    blocoPrecoHtml = `
+                        <div style="margin-top:5px; padding:5px 7px; background:#f0fdf4; border:1px solid #bbf7d0; border-radius:6px; font-size:0.74rem; color:#14532d;">
+                            <div>💰 <strong>H/Aluno:</strong> ${{formatarMoedaBRL(vhBase)}} &rarr; <strong style="color:#15803d;">${{formatarMoedaBRL(vhFinal)}}</strong> ${{taxaPct > 0 ? `<span style="color:#b45309;">(+${{taxaPct.toLocaleString("pt-BR")}}%)</span>` : `(s/ taxa)`}}</div>
+                            <div style="margin-top:2px;">📊 <strong>Turma/Ano (${{c.turmas}}t):</strong> ${{formatarMoedaBRL(vTurmaAnoFinal)}} | <strong>Lucro Méd.:</strong> ${{formatarMoedaBRL(vLucroMedioFinal)}}</div>
+                        </div>
+                    `;
+                }} else {{
+                    blocoPrecoHtml = `
+                        <div style="margin-top:5px; font-size:0.72rem; color:#64748b;">
+                            💰 <strong>H/Aluno:</strong> R$ 0,00 <a href="/admin/credenciamento_parana/tabelaprecocurso/" target="_blank" style="color:#2563eb; text-decoration:none; font-weight:600;">(definir no Admin ↗)</a>
+                        </div>
+                    `;
+                }}
 
                 cursosHtml += `
                     <div class="popup-course-row ${{isMatch ? 'course-match' : ''}}">
@@ -1560,6 +1877,7 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                         <div style="font-size:0.73rem; color:#64748b;">
                             CH Curso: <strong>${{c.ch_anual_curso}}h</strong> | Coord.: <strong>${{c.ch_anual_coord}}h</strong> | Sup. Téc.: <strong>${{c.ch_anual_sup_tecnico}}h</strong>
                         </div>
+                        ${{blocoPrecoHtml}}
                     </div>
                 `;
             }}
@@ -1593,6 +1911,9 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                         </div>
                         <div style="font-size:0.74rem; color:#64748b; margin-top:2px;">
                             🏛️ NRE: ${{escaparHtml(escola.nucleo_regional)}}
+                        </div>
+                        <div style="margin-top:6px;">
+                            ${{montarBadgeTaxaDeslocamento(escola)}}
                         </div>
                     </div>
                     ${{contatoInfo}}
@@ -1759,12 +2080,14 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
         function aplicarFiltros(isInitialLoad = false) {{
             const filtros = obterFiltrosAtivos();
             escolasFiltradasAtuais = ESCOLAS_DATA.filter(esc => escolaPassaNosFiltros(esc, filtros));
+            calcularTaxasDeslocamento(escolasFiltradasAtuais, filtros);
 
             atualizarMarcadoresNoMapa(escolasFiltradasAtuais, filtros, isInitialLoad);
             atualizarTabelaAbaixoDoMapa(escolasFiltradasAtuais, filtros);
             atualizarKPIsEFavoritos(escolasFiltradasAtuais, filtros);
             atualizarChipsAtivos(filtros.cursos);
             renderizarPilulasFiltrosAtivos(filtros);
+            atualizarCirculoRaioSeAtivo();
         }}
 
         function atualizarMarcadoresNoMapa(escolasVisiveis, filtros, isInitialLoad) {{
@@ -1777,7 +2100,8 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                     icon: iconeMarcadorEscola(esc),
                     zIndexOffset: esc.favorito ? 1000 : 0
                 }});
-                marker.bindPopup(() => montarHtmlPopup(esc, filtros), {{ maxWidth: 390 }});
+                marker.bindPopup(() => montarHtmlPopup(esc, filtros), {{ maxWidth: 410 }});
+                marker.on("click", () => desenharCirculoRaioEscola(esc));
                 marker.addTo(markersLayer);
                 markersByItem.set(esc.item_edital, marker);
                 coords.push([esc.latitude, esc.longitude]);
@@ -1804,6 +2128,11 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
 
         function visaoGeralParana() {{
             if (!map) return;
+            if (radiusCircleLayer) {{
+                map.removeLayer(radiusCircleLayer);
+                radiusCircleLayer = null;
+                escolaFocadaRaio = null;
+            }}
             map.flyTo([-24.65, -51.55], 7, {{ duration: 0.7 }});
         }}
 
@@ -1814,15 +2143,20 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             let ofertasVisiveis = 0;
             let turmasVisiveis = 0;
             let chTotalVisivel = 0;
+            let receitaAnualTotalComTaxa = 0.0;
+            let lucroMedioAnualComTaxa = 0.0;
 
             const temFiltroCurso = temFiltroCursoOuTurnoOuModalidade(filtros);
 
             for (const esc of escolasVisiveis) {{
+                const fator = Number(esc._fatorTaxa || 1.0);
                 for (const c of esc.cursos) {{
                     if (!temFiltroCurso || cursoPassaFiltroIndividual(c, filtros)) {{
                         ofertasVisiveis += 1;
                         turmasVisiveis += c.turmas;
                         chTotalVisivel += c.ch_total_oferta;
+                        receitaAnualTotalComTaxa += Number(c.valor_turma_ano || 0) * fator * Number(c.turmas || 1);
+                        lucroMedioAnualComTaxa += Number(c.lucro_medio_5anos || 0) * fator * Number(c.turmas || 1);
                     }}
                 }}
             }}
@@ -1834,6 +2168,8 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             document.getElementById("kpi-cursos").textContent = `${{ofertasVisiveis}}`;
             document.getElementById("kpi-turmas").textContent = `${{turmasVisiveis}} turma(s)`;
             document.getElementById("kpi-ch-sub").textContent = `${{chTotalVisivel.toLocaleString("pt-BR")}} horas anuais (total)`;
+            document.getElementById("kpi-receita-anual").textContent = formatarMoedaBRL(receitaAnualTotalComTaxa);
+            document.getElementById("kpi-lucro-sub").textContent = `Lucro Médio 5 anos: ${{formatarMoedaBRL(lucroMedioAnualComTaxa)}}`;
             document.getElementById("kpi-favoritos").textContent = `${{favoritas.length}}`;
             document.getElementById("badge-count-fav").textContent = `${{favoritas.length}}`;
             document.getElementById("drawer-fav-count").textContent = `${{favoritas.length}}`;
@@ -1870,6 +2206,7 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             let htmlFavs = "";
             for (const esc of favoritas) {{
                 const resumoCursos = esc.cursos.map(c => `${{c.nome_curso}} (${{c.turno}})`).join(" • ");
+                const taxaPct = Number(esc._taxaDeslocamentoPct || 0);
                 htmlFavs += `
                     <div class="fav-item-card" onclick="focarEscolaNoMapa(${{esc.item_edital}})">
                         <div class="fav-item-top">
@@ -1887,6 +2224,9 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                         <div style="color:#1d4ed8; font-size:0.74rem; margin-top:4px; font-weight:600;">
                             🎓 ${{escaparHtml(resumoCursos)}}
                         </div>
+                        <div style="font-size:0.73rem; color:#15803d; margin-top:4px; font-weight:700;">
+                            🚗 Taxa na filtragem: +${{taxaPct.toLocaleString("pt-BR")}}% (${{esc._cursosNoRaio || 0}} curso(s) no raio)
+                        </div>
                     </div>
                 `;
             }}
@@ -1898,7 +2238,7 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             if (escolasVisiveis.length === 0) {{
                 tbody.innerHTML = `
                     <tr>
-                        <td colspan="6" style="text-align:center; padding:36px; color:#64748b; font-size:0.95rem;">
+                        <td colspan="7" style="text-align:center; padding:36px; color:#64748b; font-size:0.95rem;">
                             🔍 Nenhuma escola encontrada para a combinação atual de filtros. Clique em <strong>🧹 Limpar Filtros</strong> para restaurar todas as 147 escolas.
                         </td>
                     </tr>
@@ -1910,7 +2250,10 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
 
             let rowsHtml = "";
             for (const esc of escolasVisiveis) {{
+                const fatorTaxa = Number(esc._fatorTaxa || 1.0);
+                const taxaPct = Number(esc._taxaDeslocamentoPct || 0.0);
                 let cursosRowsHtml = "";
+
                 for (const c of esc.cursos) {{
                     const bateFiltro = temFiltroCurso && cursoPassaFiltroIndividual(c, filtros);
                     const badgeMod = c.tipo_modalidade === "subsequente"
@@ -1918,14 +2261,46 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                         : `<span class="badge badge-integrado">Médio Integrado</span>`;
                     const badgeTurno = `<span class="badge ${{classeBadgeTurno(c.turno)}}">${{escaparHtml(c.turno)}}</span>`;
 
+                    const vhBase = Number(c.valor_hora_aluno || 0);
+                    let celulaPrecoHtml = "";
+                    if (vhBase > 0) {{
+                        const vhFinal = vhBase * fatorTaxa;
+                        const vhTurmaFinal = Number(c.valor_hora_turma || 0) * fatorTaxa;
+                        const vTurmaAnoFinal = Number(c.valor_turma_ano || 0) * fatorTaxa * Number(c.turmas || 1);
+                        const vLucroMedioFinal = Number(c.lucro_medio_5anos || 0) * fatorTaxa * Number(c.turmas || 1);
+
+                        celulaPrecoHtml = `
+                            <div class="price-tag-box">
+                                <span>H/Aluno Base: <strong>${{formatarMoedaBRL(vhBase)}}</strong></span>
+                                <span>&rarr;</span>
+                                <span style="color:#15803d;">c/ Taxa (+${{taxaPct.toLocaleString("pt-BR")}}%): <strong>${{formatarMoedaBRL(vhFinal)}}</strong></span>
+                            </div>
+                            <div style="font-size:0.74rem; color:#334155; margin-top:4px;">
+                                H/Turma: <strong>${{formatarMoedaBRL(vhTurmaFinal)}}</strong> •
+                                Turma/Ano (${{c.turmas}}t): <strong>${{formatarMoedaBRL(vTurmaAnoFinal)}}</strong> •
+                                Lucro Méd. (5a): <strong style="color:#15803d;">${{formatarMoedaBRL(vLucroMedioFinal)}}</strong>
+                            </div>
+                        `;
+                    }} else {{
+                        celulaPrecoHtml = `
+                            <span class="price-tag-zero">
+                                💰 H/Aluno: R$ 0,00
+                                <a href="/admin/credenciamento_parana/tabelaprecocurso/" target="_blank" style="color:#2563eb; text-decoration:none; margin-left:4px;">(editar no Admin ↗)</a>
+                            </span>
+                        `;
+                    }}
+
                     cursosRowsHtml += `
                         <tr class="${{bateFiltro ? 'course-highlight' : ''}}">
-                            <td style="width:155px;">${{badgeMod}}</td>
-                            <td style="font-weight:700; color:#0f172a;">${{escaparHtml(c.nome_curso)}}</td>
-                            <td style="width:95px;">${{badgeTurno}}</td>
-                            <td style="width:80px; text-align:center;"><strong>${{c.turmas}}</strong> turma(s)</td>
-                            <td style="width:210px; font-size:0.75rem; color:#475569;">
-                                Curso: <strong>${{c.ch_anual_curso}}h</strong> | Coord: <strong>${{c.ch_anual_coord}}h</strong> | Sup: <strong>${{c.ch_anual_sup_tecnico}}h</strong>
+                            <td style="width:135px;">${{badgeMod}}</td>
+                            <td style="font-weight:700; color:#0f172a; width:195px;">${{escaparHtml(c.nome_curso)}}</td>
+                            <td style="width:85px;">${{badgeTurno}}</td>
+                            <td style="width:75px; text-align:center;">
+                                <strong>${{c.turmas}}</strong> turma(s)
+                                <div style="font-size:0.7rem; color:#64748b;">${{c.ch_anual_curso}}h</div>
+                            </td>
+                            <td>
+                                ${{celulaPrecoHtml}}
                             </td>
                         </tr>
                     `;
@@ -1974,6 +2349,9 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                             </div>
                         </td>
                         <td>
+                            ${{montarBadgeTaxaDeslocamento(esc)}}
+                        </td>
+                        <td>
                             <table class="course-mini-table">
                                 <tbody>
                                     ${{cursosRowsHtml}}
@@ -1997,6 +2375,7 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
             // Atualiza imediatamente no mapa, nos KPIs e na tabela
             const filtros = obterFiltrosAtivos();
             escolasFiltradasAtuais = ESCOLAS_DATA.filter(esc => escolaPassaNosFiltros(esc, filtros));
+            calcularTaxasDeslocamento(escolasFiltradasAtuais, filtros);
 
             const marker = markersByItem.get(escola.item_edital);
             if (marker) {{
@@ -2045,6 +2424,8 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                 document.getElementById("secao-mapa").scrollIntoView({{ behavior: "smooth", block: "start" }});
             }}
 
+            desenharCirculoRaioEscola(escola);
+
             let marker = markersByItem.get(itemEdital);
             if (!marker) {{
                 // Se estava oculta pelo filtro atual, cria/abre temporariamente
@@ -2053,11 +2434,11 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                     icon: iconeMarcadorEscola(escola),
                     zIndexOffset: 1000
                 }}).addTo(markersLayer);
-                marker.bindPopup(() => montarHtmlPopup(escola, filtros), {{ maxWidth: 390 }});
+                marker.bindPopup(() => montarHtmlPopup(escola, filtros), {{ maxWidth: 410 }});
                 markersByItem.set(itemEdital, marker);
             }}
 
-            map.flyTo([escola.latitude, escola.longitude], 16, {{ duration: 0.75 }});
+            map.flyTo([escola.latitude, escola.longitude], 12, {{ duration: 0.75 }});
             setTimeout(() => {{
                 marker.openPopup();
             }}, 400);
@@ -2140,15 +2521,27 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                 "Item", "Favorito", "Nucleo Regional", "Municipio", "Escola",
                 "Cod. MEC", "Endereco", "CEP", "Telefone", "Email", "Responsavel",
                 "Modalidade", "Curso", "Turno", "Turmas", "CH Anual Curso",
-                "CH Anual Coord", "CH Anual Sup Tecnico", "Latitude", "Longitude"
+                "CH Anual Coord", "CH Anual Sup Tecnico",
+                "Cursos Filtrados no Raio", "Raio (km)", "Taxa Deslocamento (%)",
+                "H/Aluno Base (R$)", "H/Aluno c/ Taxa (R$)",
+                "H/Turma c/ Taxa (R$)", "Turma/Ano Total c/ Taxa (R$)", "Lucro Medio 5a c/ Taxa (R$)",
+                "Latitude", "Longitude"
             ];
             const linhas = [cabecalho.join(";")];
             const filtros = obterFiltrosAtivos();
             const temFiltroCurso = temFiltroCursoOuTurnoOuModalidade(filtros);
 
             for (const esc of escolasFiltradasAtuais) {{
+                const fator = Number(esc._fatorTaxa || 1.0);
+                const taxaPct = Number(esc._taxaDeslocamentoPct || 0.0);
                 for (const c of esc.cursos) {{
                     if (temFiltroCurso && !cursoPassaFiltroIndividual(c, filtros)) continue;
+                    const vhBase = Number(c.valor_hora_aluno || 0);
+                    const vhComTaxa = (vhBase * fator).toFixed(2).replace(".", ",");
+                    const vhTurmaComTaxa = (Number(c.valor_hora_turma || 0) * fator).toFixed(2).replace(".", ",");
+                    const vTurmaAnoComTaxa = (Number(c.valor_turma_ano || 0) * fator * Number(c.turmas || 1)).toFixed(2).replace(".", ",");
+                    const vLucroMedioComTaxa = (Number(c.lucro_medio_5anos || 0) * fator * Number(c.turmas || 1)).toFixed(2).replace(".", ",");
+
                     const cols = [
                         esc.item_edital,
                         esc.favorito ? "SIM" : "NAO",
@@ -2168,6 +2561,14 @@ def mapa_credenciamento_parana(request: HttpRequest) -> HttpResponse:
                         c.ch_anual_curso,
                         c.ch_anual_coord,
                         c.ch_anual_sup_tecnico,
+                        esc._cursosNoRaio || 0,
+                        esc._raioKmUsado || 200,
+                        taxaPct.toFixed(2).replace(".", ","),
+                        vhBase.toFixed(2).replace(".", ","),
+                        vhComTaxa,
+                        vhTurmaComTaxa,
+                        vTurmaAnoComTaxa,
+                        vLucroMedioComTaxa,
                         esc.latitude,
                         esc.longitude
                     ];

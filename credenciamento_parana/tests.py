@@ -1,10 +1,15 @@
+from decimal import Decimal
 import json
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
 from credenciamento_parana.dados_anexo1 import sincronizar_escolas_credenciamento
-from credenciamento_parana.models import EscolaCredenciamento, OfertaCursoEscola
+from credenciamento_parana.models import (
+    EscolaCredenciamento,
+    OfertaCursoEscola,
+    TabelaPrecoCurso,
+)
 
 
 class CredenciamentoParanaTests(TestCase):
@@ -51,5 +56,31 @@ class CredenciamentoParanaTests(TestCase):
         self.assertEqual(resp_tile["Content-Type"], "image/png")
         self.assertNotIn(len(resp_tile.content), (6672, 6725))
         self.assertGreater(len(resp_tile.content), 1000)
+
+    def test_tabela_precos_cursos_csv_e_edicao_admin(self):
+        sincronizar_escolas_credenciamento()
+        preco_ia_int = TabelaPrecoCurso.objects.get(
+            nome_curso="INTELIGÊNCIA ARTIFICIAL", tipo_modalidade="integrado"
+        )
+        self.assertEqual(preco_ia_int.valor_hora_aluno, Decimal("25.85"))
+        self.assertEqual(preco_ia_int.valor_hora_turma, Decimal("904.77"))
+        self.assertEqual(preco_ia_int.valor_turma_ano, Decimal("361907.18"))
+
+        preco_ds_sub = TabelaPrecoCurso.objects.get(
+            nome_curso="DESENVOLVIMENTO DE SISTEMAS", tipo_modalidade="subsequente"
+        )
+        self.assertEqual(preco_ds_sub.valor_hora_aluno, Decimal("13.57"))
+
+        # Curso sem preço no CSV inicia com 0.00 e recalcula ao ser alterado no Admin
+        preco_eletro = TabelaPrecoCurso.objects.get(
+            nome_curso="ELETROTÉCNICA", tipo_modalidade="integrado"
+        )
+        self.assertEqual(preco_eletro.valor_hora_aluno, Decimal("0.00"))
+        preco_eletro.valor_hora_aluno = Decimal("20.00")
+        preco_eletro.save()
+        preco_eletro.refresh_from_db()
+        self.assertEqual(preco_eletro.valor_hora_turma, Decimal("700.00"))
+        self.assertEqual(preco_eletro.valor_turma_ano, Decimal("280000.00"))
+
 
 
